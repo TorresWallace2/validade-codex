@@ -54,6 +54,12 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  max-width: calc(100vw - 2rem);
+}
+
+#toast-container .toast {
+  max-width: calc(100vw - 2rem);
+  overflow-wrap: anywhere;
 }
 
 .badge-status {

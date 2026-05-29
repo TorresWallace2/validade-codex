@@ -1462,10 +1462,6 @@ async function triggerSimpleAction(endpoint) {
 }
 
 async function quickValidity(type) {
-  if (isGoogleDrivePath()) {
-    showToast('Validade em arquivos do Google Drive ainda nao esta habilitada.', 'info');
-    return;
-  }
   const paths = getValidityTargetPaths();
   if (paths.length === 0) {
     showToast('Selecione ao menos um item para atualizar a validade.', 'warning');
@@ -1520,10 +1516,6 @@ async function quickValidity(type) {
 }
 
 async function submitValidity() {
-  if (isGoogleDrivePath()) {
-    showToast('Validade em arquivos do Google Drive ainda nao esta habilitada.', 'info');
-    return;
-  }
   if (!state.selectedPath) {
     return;
   }

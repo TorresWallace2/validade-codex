@@ -22,6 +22,7 @@ from flask import current_app, session
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 
 from ..status import (
@@ -650,6 +651,73 @@ def create_folder(parent_path: str, name: str) -> dict[str, Any]:
     )
     _clear_drive_session_caches()
     return _item_to_dict(item, metadata_svc.get_metadata(item["id"]))
+
+
+def create_file(parent_path: str, name: str) -> dict[str, Any]:
+    parent_id = path_to_id(parent_path)
+    drive = service()
+    media = MediaIoBaseUpload(io.BytesIO(b""), mimetype="text/plain", resumable=False)
+    try:
+        item = drive.files().create(
+            body={"name": name, "parents": [parent_id]},
+            media_body=media,
+            fields="id,name,mimeType,size,modifiedTime,webViewLink,parents",
+            supportsAllDrives=True,
+        ).execute()
+    except HttpError as exc:
+        raise GoogleDriveError(f"Sem permissao ou falha ao criar arquivo no Drive: {exc}") from exc
+
+    metadata_svc.touch_file(
+        item["id"],
+        file_name=item.get("name", name),
+        source_uri=id_to_path(item["id"]),
+        mime_type=item.get("mimeType", ""),
+        web_url=item.get("webViewLink", ""),
+    )
+    _clear_drive_session_caches()
+    return _item_to_dict(item, metadata_svc.get_metadata(item["id"]))
+
+
+def upload_files(parent_path: str, files: list[Any]) -> list[dict[str, Any]]:
+    parent_id = path_to_id(parent_path)
+    drive = service()
+    uploaded: list[dict[str, Any]] = []
+
+    for uploaded_file in files:
+        filename = getattr(uploaded_file, "filename", "") or "arquivo"
+        stream = getattr(uploaded_file, "stream", uploaded_file)
+        try:
+            if hasattr(stream, "seek"):
+                stream.seek(0)
+            media = MediaIoBaseUpload(
+                stream,
+                mimetype=getattr(uploaded_file, "mimetype", None) or "application/octet-stream",
+                resumable=False,
+            )
+            item = drive.files().create(
+                body={"name": filename, "parents": [parent_id]},
+                media_body=media,
+                fields="id,name,mimeType,size,modifiedTime,webViewLink,parents",
+                supportsAllDrives=True,
+            ).execute()
+        except HttpError as exc:
+            raise GoogleDriveError(f"Sem permissao ou falha no upload para o Drive: {exc}") from exc
+
+        inferred = _extract_validity_from_filename(filename)
+        meta = metadata_svc.apply_auto_validity_from_filename(
+            item["id"],
+            item.get("name", filename),
+            inferred,
+            source_uri=id_to_path(item["id"]),
+            mime_type=item.get("mimeType", ""),
+            web_url=item.get("webViewLink", ""),
+        )
+        data = _item_to_dict(item, meta)
+        data["auto_validity"] = inferred is not None
+        uploaded.append(data)
+
+    _clear_drive_session_caches()
+    return uploaded
 
 
 def rename_item(path: str, new_name: str) -> dict[str, Any]:

@@ -1,0 +1,80 @@
+﻿:root {
+  --sidebar-width: 360px;
+}
+
+body {
+  min-height: 100vh;
+}
+
+.table tbody tr {
+  cursor: pointer;
+}
+
+.table tbody tr.active {
+  background-color: rgba(13, 110, 253, 0.15);
+}
+
+.table tbody tr.multi-selected {
+  background-color: rgba(25, 135, 84, 0.18);
+}
+
+.table tbody tr.multi-selected.active {
+  background-color: rgba(13, 110, 253, 0.28);
+}
+
+.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.sortable .bi {
+  opacity: 0.3;
+  margin-left: 0.25rem;
+}
+
+.sortable.active .bi {
+  opacity: 1;
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  backdrop-filter: blur(2px);
+  background-color: rgba(255, 255, 255, 0.55);
+}
+
+[data-bs-theme="dark"] .loading-overlay {
+  background-color: rgba(0, 0, 0, 0.45);
+}
+
+.toast-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.badge-status {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.5rem;
+}
+
+#itemsTable tbody td:last-child {
+  white-space: nowrap;
+}
+
+#detailsCard {
+  min-height: 500px;
+}
+
+textarea#notesInput {
+  resize: vertical;
+}
+
+@media (max-width: 991px) {
+  .card-header nav {
+    max-width: 100%;
+  }
+}

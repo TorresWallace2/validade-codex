@@ -1,0 +1,10 @@
+@"
+.venv/
+__pycache__/
+*.pyc
+.tmp/
+.vscode/
+instance/
+VALIDADE-CODEX.rar
+.env
+"@ | Out-File -Encoding utf8 .gitignore

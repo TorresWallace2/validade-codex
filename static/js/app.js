@@ -1350,8 +1350,10 @@ function clearDetails() {
 }
 
 function updateActionButtons() {
-  const driveMode = isGoogleDrivePath();
   const enabled = Boolean(state.selectedPath);
+  const selectedCount = state.selectedPaths ? state.selectedPaths.size : 0;
+  const hasCurrentPath = Boolean(state.currentPath);
+
   [
     elements.btnSaveNotes,
     elements.btnResetNotes,
@@ -1367,35 +1369,31 @@ function updateActionButtons() {
     }
   });
 
-  if (driveMode) {
-    [
-      elements.btnSaveNotes,
-      elements.btnResetNotes,
-      elements.btnSetValidity,
-      elements.btnMarkIndeterminate,
-      elements.btnClearValidity,
-      elements.btnRename,
-      elements.btnMove,
-      elements.btnCopy,
-      elements.btnDelete,
-      elements.btnUpload,
-      elements.btnNewFolder,
-      elements.btnNewFile,
-      elements.btnExport,
-    ].forEach((button) => {
-      if (button) button.disabled = true;
-    });
-  } else {
-    [
-      elements.btnMove,
-      elements.btnCopy,
-      elements.btnUpload,
-      elements.btnNewFolder,
-      elements.btnNewFile,
-      elements.btnExport,
-    ].forEach((button) => {
-      if (button) button.disabled = false;
-    });
+  [
+    elements.btnUpload,
+    elements.btnNewFolder,
+    elements.btnNewFile,
+    elements.btnExport,
+  ].forEach((button) => {
+    if (button) {
+      button.disabled = !hasCurrentPath;
+      button.classList.toggle('disabled', !hasCurrentPath);
+      if (hasCurrentPath) {
+        button.removeAttribute('aria-disabled');
+      } else {
+        button.setAttribute('aria-disabled', 'true');
+      }
+    }
+  });
+
+  if (elements.btnMove) {
+    elements.btnMove.disabled = selectedCount === 0;
+  }
+  if (elements.btnCopy) {
+    elements.btnCopy.disabled = selectedCount === 0;
+  }
+  if (elements.btnDelete) {
+    elements.btnDelete.disabled = selectedCount === 0;
   }
 
   if (elements.btnOpenFile) {
@@ -1605,10 +1603,6 @@ async function submitRename() {
 }
 
 async function submitCreateFolder() {
-  if (isGoogleDrivePath()) {
-    showToast('Criar pasta no Google Drive ainda nao esta habilitado.', 'info');
-    return;
-  }
   const name = elements.newFolderName.value.trim();
   if (!name) {
     showToast('Informe o nome da pasta.', 'warning');
@@ -1634,10 +1628,6 @@ async function submitCreateFolder() {
 }
 
 async function submitCreateFile() {
-  if (isGoogleDrivePath()) {
-    showToast('Criar arquivo no Google Drive ainda nao esta habilitado.', 'info');
-    return;
-  }
   const name = elements.newFileName.value.trim();
   if (!name) {
     showToast('Informe o nome do arquivo.', 'warning');
@@ -1663,10 +1653,6 @@ async function submitCreateFile() {
 }
 
 async function submitUpload() {
-  if (isGoogleDrivePath()) {
-    showToast('Upload direto para Google Drive ainda nao esta habilitado.', 'info');
-    return;
-  }
   const files = elements.uploadInput.files;
   if (!files || files.length === 0) {
     showToast('Selecione ao menos um arquivo.', 'warning');
@@ -1750,10 +1736,6 @@ function applyStatusFilter() {
 }
 
 async function handleExport() {
-  if (isGoogleDrivePath()) {
-    showToast('Exportar CSV do Google Drive ainda nao esta habilitado.', 'info');
-    return;
-  }
   if (!state.currentPath) {
     return;
   }

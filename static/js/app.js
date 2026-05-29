@@ -2159,3 +2159,22 @@ document.addEventListener('DOMContentLoaded', () => {
     obs.observe(breadcrumb, { childList: true, subtree: true });
   }
 });
+
+
+// Correção: manter ações principais disponíveis dentro do Google Drive.
+function forceEnableGoogleDriveActions() {
+  try {
+    if (typeof isGoogleDrivePath !== 'function' || !isGoogleDrivePath()) return;
+    [elements.btnUpload, elements.btnNewFolder, elements.btnNewFile, elements.btnExport].forEach((button) => {
+      if (!button) return;
+      button.disabled = false;
+      button.classList.remove('disabled');
+      button.removeAttribute('aria-disabled');
+    });
+  } catch (error) {
+    console.warn('Nao foi possivel atualizar botoes do Google Drive.', error);
+  }
+}
+setInterval(forceEnableGoogleDriveActions, 500);
+document.addEventListener('DOMContentLoaded', forceEnableGoogleDriveActions);
+document.addEventListener('click', () => setTimeout(forceEnableGoogleDriveActions, 0));

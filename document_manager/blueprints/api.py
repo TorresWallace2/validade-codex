@@ -378,8 +378,9 @@ def create_file() -> Response:
         return _json_error("Informe pasta base e nome.")
     try:
         if drive_svc.is_drive_path(parent):
-            return _json_error("Criar arquivo vazio no Google Drive nao e suportado nesta versao.")
-        data = svc.create_file(parent, name)
+        data = drive_svc.create_file(parent, name)
+        return _json_success({"data": data}, HTTPStatus.CREATED)
+    data = svc.create_file(parent, name)
         return _json_success({"data": data}, HTTPStatus.CREATED)
     except svc.DocumentServiceError as exc:
         return _json_error(str(exc))
@@ -390,9 +391,15 @@ def upload() -> Response:
     target = request.form.get("path")
     if not target:
         return _json_error("Informe o caminho da pasta.")
-    if drive_svc.is_drive_path(target):
-        return _json_error("Upload direto para Google Drive ainda nao esta implementado nesta versao.")
     files = request.files.getlist("files")
+    if drive_svc.is_drive_path(target):
+        if not files:
+            return _json_error("Nenhum arquivo enviado.")
+        try:
+            data = drive_svc.upload_files(target, files)
+            return _json_success({"data": data}, HTTPStatus.CREATED)
+        except drive_svc.GoogleDriveError as exc:
+            return _drive_error(exc)
     if not files:
         return _json_error("Nenhum arquivo enviado.")
     try:

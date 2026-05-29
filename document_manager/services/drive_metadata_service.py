@@ -1,24 +1,23 @@
 """Persistent PostgreSQL metadata for Google Drive items.
 
-This module stores Google Drive metadata outside Render's ephemeral filesystem.
-Records are keyed by Google Drive file_id, never by a display path, so metadata
-survives path/name changes and service restarts.
+Records are keyed by Google Drive file_id, never by display path.
+This keeps favorites, pregoes, notes and validity stable across Render restarts,
+Drive folder moves and service redeploys.
 """
-
 from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from datetime import date, datetime
-from typing import Any, Iterator, Optional, Sequence
+from datetime import date
+from typing import Any, Iterator, Sequence
+
+from flask import current_app
 
 try:
     import psycopg2
     import psycopg2.extras
-except ImportError:  # pragma: no cover - handled at runtime with a friendly error
+except ImportError:  # pragma: no cover
     psycopg2 = None  # type: ignore[assignment]
-
-from flask import current_app
 
 
 class DriveMetadataError(RuntimeError):
@@ -36,7 +35,6 @@ def _database_url() -> str:
         raise DriveMetadataError(
             "DATABASE_URL nao configurada. Configure a Internal Database URL do Postgres no Render."
         )
-    # Render historically exposes postgres://, psycopg2 accepts postgresql:// reliably.
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://") :]
     return url
@@ -45,9 +43,7 @@ def _database_url() -> str:
 @contextmanager
 def _connect() -> Iterator[Any]:
     if psycopg2 is None:
-        raise DriveMetadataError(
-            "Dependencia psycopg2-binary ausente. Adicione psycopg2-binary ao requirements.txt."
-        )
+        raise DriveMetadataError("Dependencia psycopg2-binary ausente. Adicione psycopg2-binary ao requirements.txt.")
     conn = psycopg2.connect(_database_url())
     try:
         yield conn
@@ -60,10 +56,10 @@ def _connect() -> Iterator[Any]:
 
 
 def init_schema() -> None:
-    """Create PostgreSQL tables used by Google Drive metadata."""
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS drive_file_metadata (
                     file_id TEXT PRIMARY KEY,
                     file_name TEXT,
@@ -84,6 +80,7 @@ def init_schema() -> None:
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
                 CREATE TABLE IF NOT EXISTS drive_user_favorites (
                     username TEXT NOT NULL,
                     file_id TEXT NOT NULL,
@@ -93,6 +90,7 @@ def init_schema() -> None:
                     PRIMARY KEY(username, file_id),
                     UNIQUE(username, name)
                 );
+
                 CREATE TABLE IF NOT EXISTS drive_user_presets (
                     username TEXT NOT NULL,
                     file_id TEXT NOT NULL,
@@ -102,13 +100,19 @@ def init_schema() -> None:
                     PRIMARY KEY(username, file_id),
                     UNIQUE(username, name)
                 );
+
                 CREATE INDEX IF NOT EXISTS idx_drive_file_metadata_updated_at
                     ON drive_file_metadata(updated_at);
-                """)
+                CREATE INDEX IF NOT EXISTS idx_drive_user_favorites_username
+                    ON drive_user_favorites(username);
+                CREATE INDEX IF NOT EXISTS idx_drive_user_presets_username
+                    ON drive_user_presets(username);
+                """
+            )
 
 
 def ensure_schema() -> None:
-    # Cheap enough for the current app size and prevents first-request failures after deploy.
+    # This avoids first-request failures after a fresh deploy/database reset.
     init_schema()
 
 
@@ -122,18 +126,14 @@ def _default_warning_days(warning_days: int | None = None) -> int:
 
 
 def _row_to_dict(row: Any | None) -> dict[str, Any]:
-    if not row:
-        return {}
-    return dict(row)
+    return dict(row) if row else {}
 
 
 def get_metadata(file_id: str) -> dict[str, Any]:
     ensure_schema()
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
-            cur.execute(
-                "SELECT * FROM drive_file_metadata WHERE file_id = %s", (file_id,)
-            )
+            cur.execute("SELECT * FROM drive_file_metadata WHERE file_id = %s", (file_id,))
             return _row_to_dict(cur.fetchone())
 
 
@@ -144,20 +144,11 @@ def get_metadata_map(file_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
     ensure_schema()
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
-            cur.execute(
-                "SELECT * FROM drive_file_metadata WHERE file_id = ANY(%s)", (ids,)
-            )
+            cur.execute("SELECT * FROM drive_file_metadata WHERE file_id = ANY(%s)", (ids,))
             return {row["file_id"]: dict(row) for row in cur.fetchall()}
 
 
-def touch_file(
-    file_id: str,
-    *,
-    file_name: str = "",
-    source_uri: str = "",
-    mime_type: str = "",
-    web_url: str = "",
-) -> None:
+def touch_file(file_id: str, *, file_name: str = "", source_uri: str = "", mime_type: str = "", web_url: str = "") -> None:
     ensure_schema()
     with _connect() as conn:
         with conn.cursor() as cur:
@@ -166,20 +157,13 @@ def touch_file(
                 INSERT INTO drive_file_metadata(file_id, file_name, source_uri, mime_type, web_url, warning_days)
                 VALUES(%s, %s, %s, %s, %s, %s)
                 ON CONFLICT(file_id) DO UPDATE SET
-                    file_name = EXCLUDED.file_name,
-                    source_uri = EXCLUDED.source_uri,
-                    mime_type = EXCLUDED.mime_type,
-                    web_url = EXCLUDED.web_url,
+                    file_name = COALESCE(NULLIF(EXCLUDED.file_name, ''), drive_file_metadata.file_name),
+                    source_uri = COALESCE(NULLIF(EXCLUDED.source_uri, ''), drive_file_metadata.source_uri),
+                    mime_type = COALESCE(NULLIF(EXCLUDED.mime_type, ''), drive_file_metadata.mime_type),
+                    web_url = COALESCE(NULLIF(EXCLUDED.web_url, ''), drive_file_metadata.web_url),
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (
-                    file_id,
-                    file_name,
-                    source_uri,
-                    mime_type,
-                    web_url,
-                    _default_warning_days(),
-                ),
+                (file_id, file_name, source_uri, mime_type, web_url, _default_warning_days()),
             )
 
 
@@ -193,46 +177,26 @@ def apply_auto_validity_from_filename(
     web_url: str = "",
     warning_days: int | None = None,
 ) -> dict[str, Any]:
-    """Store safe automatic validity metadata.
+    """Safely persist automatic validity.
 
-    Rules to prevent wrong automatic validity:
-    - Automatic collection never overrides a manually defined/indeterminate/not_defined choice.
-    - When the user explicitly sets "Nao definido", manual_locked stays true and future
-      filename scans cannot redefine the validity automatically.
-    - Auto validity is tagged with validity_source='auto_filename', so it remains auditable.
-    - If no date is detected, existing automatic/manual metadata is left unchanged.
+    Automatic filename detection must never overwrite any manual user decision,
+    including manual "Nao definido". We keep the auto-detected date for audit,
+    but only apply it when the row is not manually locked and validity is still
+    truly not defined.
     """
     ensure_schema()
-    touch_file(
-        file_id,
-        file_name=file_name,
-        source_uri=source_uri,
-        mime_type=mime_type,
-        web_url=web_url,
-    )
+    touch_file(file_id, file_name=file_name, source_uri=source_uri, mime_type=mime_type, web_url=web_url)
     if inferred_date is None:
         return get_metadata(file_id)
 
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
-            cur.execute(
-                "SELECT * FROM drive_file_metadata WHERE file_id = %s FOR UPDATE",
-                (file_id,),
-            )
-            row = cur.fetchone()
-            current_type = (
-                row.get("validity_type") if row else "not_defined"
-            ) or "not_defined"
-            manual_locked = bool(row.get("manual_locked")) if row else False
-            source = (
-                row.get("validity_source") if row else "not_defined"
-            ) or "not_defined"
-
-            can_apply = (
-                not manual_locked
-                and current_type == "not_defined"
-                and source not in MANUAL_SOURCES
-            )
+            cur.execute("SELECT * FROM drive_file_metadata WHERE file_id = %s FOR UPDATE", (file_id,))
+            row = cur.fetchone() or {}
+            current_type = (row.get("validity_type") or "not_defined")
+            manual_locked = bool(row.get("manual_locked"))
+            source = row.get("validity_source") or "not_defined"
+            can_apply = (not manual_locked and current_type == "not_defined" and source not in MANUAL_SOURCES)
             if can_apply:
                 cur.execute(
                     """
@@ -249,14 +213,7 @@ def apply_auto_validity_from_filename(
                     WHERE file_id = %s
                     RETURNING *
                     """,
-                    (
-                        inferred_date,
-                        _default_warning_days(warning_days),
-                        AUTO_SOURCE,
-                        inferred_date,
-                        file_name,
-                        file_id,
-                    ),
+                    (inferred_date, _default_warning_days(warning_days), AUTO_SOURCE, inferred_date, file_name, file_id),
                 )
             else:
                 cur.execute(
@@ -273,16 +230,11 @@ def apply_auto_validity_from_filename(
             return dict(cur.fetchone())
 
 
-def set_validity(
-    file_id: str,
-    validity_type: str,
-    validity_date: date | None,
-    warning_days: int | None = None,
-) -> dict[str, Any]:
+def set_validity(file_id: str, validity_type: str, validity_date: date | None, warning_days: int | None = None) -> dict[str, Any]:
     validity_type = (validity_type or "").lower().strip()
     if validity_type not in VALIDITY_TYPES:
         raise DriveMetadataError("Tipo de validade invalido.")
-    ensure_schema()
+
     source = "manual"
     if validity_type == "indeterminate":
         source = "manual_indeterminate"
@@ -290,6 +242,8 @@ def set_validity(
     elif validity_type == "not_defined":
         source = "manual_not_defined"
         validity_date = None
+
+    ensure_schema()
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(
@@ -305,13 +259,7 @@ def set_validity(
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING *
                 """,
-                (
-                    file_id,
-                    validity_type,
-                    validity_date,
-                    _default_warning_days(warning_days),
-                    source,
-                ),
+                (file_id, validity_type, validity_date, _default_warning_days(warning_days), source),
             )
             return dict(cur.fetchone())
 
@@ -324,7 +272,9 @@ def set_notes(file_id: str, notes: str) -> dict[str, Any]:
                 """
                 INSERT INTO drive_file_metadata(file_id, notes)
                 VALUES(%s, %s)
-                ON CONFLICT(file_id) DO UPDATE SET notes = EXCLUDED.notes, updated_at = CURRENT_TIMESTAMP
+                ON CONFLICT(file_id) DO UPDATE SET
+                    notes = EXCLUDED.notes,
+                    updated_at = CURRENT_TIMESTAMP
                 RETURNING *
                 """,
                 (file_id, notes or ""),
@@ -340,7 +290,9 @@ def set_auctions(file_id: str, auctions: str) -> dict[str, Any]:
                 """
                 INSERT INTO drive_file_metadata(file_id, auctions)
                 VALUES(%s, %s)
-                ON CONFLICT(file_id) DO UPDATE SET auctions = EXCLUDED.auctions, updated_at = CURRENT_TIMESTAMP
+                ON CONFLICT(file_id) DO UPDATE SET
+                    auctions = EXCLUDED.auctions,
+                    updated_at = CURRENT_TIMESTAMP
                 RETURNING *
                 """,
                 (file_id, auctions or ""),
@@ -348,12 +300,9 @@ def set_auctions(file_id: str, auctions: str) -> dict[str, Any]:
             return dict(cur.fetchone())
 
 
-def add_favorite(
-    username: str, file_id: str, name: str, source_uri: str
-) -> dict[str, Any]:
+def add_favorite(username: str, file_id: str, name: str, source_uri: str) -> dict[str, Any]:
     ensure_schema()
     username = (username or "").strip().upper()
-
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(
@@ -368,7 +317,6 @@ def add_favorite(
                 """,
                 (file_id, name, source_uri),
             )
-
             cur.execute(
                 """
                 INSERT INTO drive_user_favorites(username, file_id, name, source_uri)
@@ -376,11 +324,10 @@ def add_favorite(
                 ON CONFLICT(username, file_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     source_uri = EXCLUDED.source_uri
-                RETURNING file_id, name, source_uri AS path, created_at
+                RETURNING file_id AS id, file_id, name, source_uri AS path, created_at
                 """,
                 (username, file_id, name, source_uri),
             )
-
             return dict(cur.fetchone())
 
 
@@ -391,7 +338,7 @@ def list_favorites(username: str) -> list[dict[str, Any]]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(
                 """
-                SELECT file_id, name, source_uri AS path, created_at
+                SELECT file_id AS id, file_id, name, source_uri AS path, created_at
                 FROM drive_user_favorites
                 WHERE username = %s
                 ORDER BY name ASC
@@ -401,30 +348,20 @@ def list_favorites(username: str) -> list[dict[str, Any]]:
             return [dict(row) for row in cur.fetchall()]
 
 
-def delete_favorite(
-    username: str, name: str | None = None, file_id: str | None = None
-) -> None:
+def delete_favorite(username: str, name: str | None = None, file_id: str | None = None) -> None:
     ensure_schema()
     username = (username or "").strip().upper()
     with _connect() as conn:
         with conn.cursor() as cur:
             if file_id:
-                cur.execute(
-                    "DELETE FROM drive_user_favorites WHERE username = %s AND file_id = %s",
-                    (username, file_id),
-                )
+                cur.execute("DELETE FROM drive_user_favorites WHERE username = %s AND file_id = %s", (username, file_id))
             else:
-                cur.execute(
-                    "DELETE FROM drive_user_favorites WHERE username = %s AND name = %s",
-                    (username, name),
-                )
+                cur.execute("DELETE FROM drive_user_favorites WHERE username = %s AND name = %s", (username, name))
             if cur.rowcount == 0:
                 raise DriveMetadataError("Favorito nao encontrado.")
 
 
-def add_preset(
-    username: str, file_id: str, name: str, source_uri: str
-) -> dict[str, Any]:
+def add_preset(username: str, file_id: str, name: str, source_uri: str) -> dict[str, Any]:
     ensure_schema()
     username = (username or "").strip().upper()
     with _connect() as conn:
@@ -436,7 +373,7 @@ def add_preset(
                 ON CONFLICT(username, file_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     source_uri = EXCLUDED.source_uri
-                RETURNING file_id, name, source_uri AS path, created_at
+                RETURNING file_id AS id, file_id, name, source_uri AS path, created_at
                 """,
                 (username, file_id, name, source_uri),
             )
@@ -450,7 +387,7 @@ def list_presets(username: str) -> list[dict[str, Any]]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(
                 """
-                SELECT file_id, name, source_uri AS path, created_at
+                SELECT file_id AS id, file_id, name, source_uri AS path, created_at
                 FROM drive_user_presets
                 WHERE username = %s
                 ORDER BY name ASC
@@ -466,9 +403,6 @@ def delete_preset(username: str, preset_id_or_file_id: Any) -> None:
     value = str(preset_id_or_file_id or "").strip()
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM drive_user_presets WHERE username = %s AND file_id = %s",
-                (username, value),
-            )
+            cur.execute("DELETE FROM drive_user_presets WHERE username = %s AND file_id = %s", (username, value))
             if cur.rowcount == 0:
                 raise DriveMetadataError("Pregao nao encontrado.")

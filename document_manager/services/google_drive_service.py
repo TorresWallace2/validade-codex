@@ -1,10 +1,19 @@
-"""Google Drive integration helpers with PostgreSQL metadata persistence."""
+"""Google Drive integration helpers with PostgreSQL metadata persistence.
+
+Performance notes:
+- list_items() is intentionally read-only for metadata. It no longer writes/touches
+  one row per file while browsing a Drive folder.
+- Drive listing responses, folder parents and breadcrumbs are cached in Flask's
+  session for a short period to avoid repeated Google Drive API calls while the
+  user navigates back and forth.
+"""
 from __future__ import annotations
 
 import csv
 import io
 import os
 import re
+import time
 from datetime import date, datetime
 from typing import Any, Optional
 from urllib.parse import quote, unquote
@@ -15,12 +24,23 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from ..status import compute_status, format_display_date, normalise_validity_input, parse_validity_date
+from ..status import (
+    compute_status,
+    format_display_date,
+    normalise_validity_input,
+    parse_validity_date,
+)
 from . import drive_metadata_service as metadata_svc
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 DRIVE_PREFIX = "gdrive://"
 ROOT_PATH = "gdrive://root"
+DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+
+# Keep this short. It is enough to make navigation feel instant when users go
+# back/forward, without keeping Drive data stale for too long.
+LIST_CACHE_TTL_SECONDS = int(os.environ.get("GOOGLE_DRIVE_LIST_CACHE_TTL", "60"))
+FOLDER_META_CACHE_TTL_SECONDS = int(os.environ.get("GOOGLE_DRIVE_FOLDER_META_CACHE_TTL", "300"))
 
 VALIDITY_IN_FILENAME_RE = re.compile(
     r"\bVAL(?:IDADE)?\.?\s*([0-3]?\d[\/\-.][0-1]?\d[\/\-.]\d{4})\b",
@@ -80,15 +100,18 @@ def finish_authorization(authorization_response: str, state: str | None) -> None
     expected_state = session.get("google_oauth_state")
     if not expected_state or state != expected_state:
         raise GoogleDriveError("Sessao OAuth invalida. Tente conectar novamente.")
+
     flow = create_flow()
     code_verifier = session.get("google_oauth_code_verifier")
     if code_verifier:
         flow.code_verifier = code_verifier
+
     flow.fetch_token(authorization_response=authorization_response)
     credentials = flow.credentials
     session["google_drive_credentials"] = credentials_to_dict(credentials)
     session.pop("google_oauth_state", None)
     session.pop("google_oauth_code_verifier", None)
+    _clear_drive_session_caches()
 
 
 def credentials_to_dict(credentials: Credentials) -> dict[str, Any]:
@@ -116,6 +139,7 @@ def is_connected() -> bool:
 def disconnect() -> None:
     session.pop("google_drive_credentials", None)
     session.pop("google_oauth_state", None)
+    _clear_drive_session_caches()
 
 
 def service():
@@ -142,17 +166,67 @@ def path_to_id(path: str | None) -> str:
     return file_id or "root"
 
 
+def _now() -> int:
+    return int(time.time())
+
+
+def _session_cache_get(namespace: str, key: str, ttl_seconds: int) -> Any | None:
+    cache = session.get(namespace) or {}
+    entry = cache.get(key)
+    if not entry:
+        return None
+    if _now() - int(entry.get("ts", 0)) > ttl_seconds:
+        cache.pop(key, None)
+        session[namespace] = cache
+        return None
+    return entry.get("value")
+
+
+def _session_cache_set(namespace: str, key: str, value: Any) -> None:
+    cache = session.get(namespace) or {}
+    cache[key] = {"ts": _now(), "value": value}
+
+    # Flask cookie sessions have a size limit. Keep only the most recent entries.
+    if len(cache) > 30:
+        sorted_items = sorted(cache.items(), key=lambda item: item[1].get("ts", 0), reverse=True)
+        cache = dict(sorted_items[:30])
+
+    session[namespace] = cache
+
+
+def _clear_drive_session_caches() -> None:
+    for key in (
+        "google_drive_list_cache",
+        "google_drive_folder_meta_cache",
+        "google_drive_breadcrumb_cache",
+    ):
+        session.pop(key, None)
+    for key in list(session.keys()):
+        if str(key).startswith("google_drive_page_tokens:"):
+            session.pop(key, None)
+
+
+def _invalidate_drive_list_cache() -> None:
+    session.pop("google_drive_list_cache", None)
+    for key in list(session.keys()):
+        if str(key).startswith("google_drive_page_tokens:"):
+            session.pop(key, None)
+
+
 def _extract_validity_from_filename(filename: str) -> Optional[date]:
     match = VALIDITY_IN_FILENAME_RE.search(filename or "")
     if not match:
         return None
+
     raw_value = match.group(1).strip().replace(".", "-").replace("/", "-")
     parts = raw_value.split("-")
     if len(parts) != 3:
         return None
+
     day_str, month_str, year_str = parts
     if len(year_str) != 4:
         return None
+
     try:
         return date(int(year_str), int(month_str), int(day_str))
     except ValueError:
@@ -206,15 +280,22 @@ def _status_dict(meta: dict[str, Any] | None) -> dict[str, Any]:
     if isinstance(validity_date, str):
         validity_date = parse_validity_date(validity_date)
     status = compute_status(validity_type, validity_date, _default_warning_days(meta))
-    return {"code": status.code, "key": status.code, "label": status.label, "icon": status.icon, "color": status.color}
+    return {
+        "code": status.code,
+        "key": status.code,
+        "label": status.label,
+        "icon": status.icon,
+        "color": status.color,
+    }
 
 
 def _item_to_dict(item: dict[str, Any], meta: dict[str, Any] | None = None) -> dict[str, Any]:
-    is_folder = item.get("mimeType") == "application/vnd.google-apps.folder"
+    is_folder = item.get("mimeType") == DRIVE_FOLDER_MIME_TYPE
     path = id_to_path(item["id"])
     meta = meta or {}
     validity_type = meta.get("validity_type") or "not_defined"
     validity_date = meta.get("validity_date")
+
     return {
         "name": item.get("name", "Sem nome"),
         "path": path,
@@ -224,7 +305,9 @@ def _item_to_dict(item: dict[str, Any], meta: dict[str, Any] | None = None) -> d
         "validity": _validity_display(validity_type, validity_date),
         "validity_type": validity_type,
         "validity_source": meta.get("validity_source", "not_defined"),
-        "auto_detected_date": format_display_date(meta.get("auto_detected_date")) if meta.get("auto_detected_date") else None,
+        "auto_detected_date": format_display_date(meta.get("auto_detected_date"))
+        if meta.get("auto_detected_date")
+        else None,
         "manual_locked": bool(meta.get("manual_locked")),
         "status": _status_dict(meta),
         "icon": "bi bi-folder-fill" if is_folder else "bi bi-file-earmark-text",
@@ -238,36 +321,119 @@ def _item_to_dict(item: dict[str, Any], meta: dict[str, Any] | None = None) -> d
     }
 
 
+def _folder_metadata(file_id: str) -> dict[str, Any]:
+    """Return folder id/name/parents with session cache."""
+    if file_id == "root":
+        return {"id": "root", "name": "Google Drive", "parents": []}
+
+    cached = _session_cache_get(
+        "google_drive_folder_meta_cache",
+        file_id,
+        FOLDER_META_CACHE_TTL_SECONDS,
+    )
+    if cached:
+        return cached
+
+    drive = service()
+    item = drive.files().get(
+        fileId=file_id,
+        fields="id,name,parents",
+        supportsAllDrives=True,
+    ).execute()
+    _session_cache_set("google_drive_folder_meta_cache", file_id, item)
+    return item
+
+
+def _parent_path_for(file_id: str, raw_items: list[dict[str, Any]] | None = None) -> str:
+    if file_id == "root":
+        return ROOT_PATH
+
+    # When opening a child folder, the item might already be available in a cached
+    # previous listing. But if not, this does at most one cached files.get call.
+    try:
+        current = _folder_metadata(file_id)
+        parents = current.get("parents") or []
+        if parents:
+            return id_to_path(parents[0])
+    except HttpError:
+        pass
+    return ROOT_PATH
+
+
 def _breadcrumbs_for(file_id: str) -> list[dict[str, str]]:
+    cached = _session_cache_get(
+        "google_drive_breadcrumb_cache",
+        file_id,
+        FOLDER_META_CACHE_TTL_SECONDS,
+    )
+    if cached:
+        return cached
+
     breadcrumbs = [{"label": "Google Drive", "path": ROOT_PATH}]
     if file_id == "root":
+        _session_cache_set("google_drive_breadcrumb_cache", file_id, breadcrumbs)
         return breadcrumbs
+
     try:
-        drive = service()
-        current = drive.files().get(fileId=file_id, fields="id,name,parents", supportsAllDrives=True).execute()
+        current = _folder_metadata(file_id)
         chain = []
         guard = 0
         while current and current.get("id") != "root" and guard < 40:
             chain.append({"label": current.get("name", "Sem nome"), "path": id_to_path(current["id"])})
             parents = current.get("parents") or []
-            if not parents:
+            if not parents or parents[0] == "root":
                 break
-            parent_id = parents[0]
-            if parent_id == "root":
-                break
-            current = drive.files().get(fileId=parent_id, fields="id,name,parents", supportsAllDrives=True).execute()
+            current = _folder_metadata(parents[0])
             guard += 1
         breadcrumbs.extend(reversed(chain))
     except HttpError:
         breadcrumbs.append({"label": file_id, "path": id_to_path(file_id)})
+
+    _session_cache_set("google_drive_breadcrumb_cache", file_id, breadcrumbs)
     return breadcrumbs
 
 
-def _apply_metadata_to_items(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def _metadata_for_list_items(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Read metadata only; never write during folder browsing.
+
+    The previous implementation called apply_auto_validity_from_filename() or
+    touch_file() for every listed item. That made browsing slow because opening a
+    Drive folder could trigger dozens/hundreds of database writes. Here we infer
+    the date in memory only when no saved metadata exists.
+    """
     ids = [item["id"] for item in items]
-    metadata_map = metadata_svc.get_metadata_map(ids)
+    metadata_map = metadata_svc.get_metadata_map(ids) if ids else {}
+
     for item in items:
-        is_folder = item.get("mimeType") == "application/vnd.google-apps.folder"
+        item_id = item["id"]
+        is_folder = item.get("mimeType") == DRIVE_FOLDER_MIME_TYPE
+        if is_folder or item_id in metadata_map:
+            continue
+
+        inferred = _extract_validity_from_filename(item.get("name", ""))
+        if inferred is not None:
+            metadata_map[item_id] = {
+                "validity_type": "defined",
+                "validity_date": inferred,
+                "validity_source": "filename",
+                "auto_detected_date": inferred,
+                "manual_locked": False,
+                "warning_days": None,
+                "notes": "",
+                "is_favorite": False,
+                "auctions": "",
+            }
+
+    return metadata_map
+
+
+def _apply_metadata_to_items(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Write/touch metadata for explicit item operations, not for browsing."""
+    ids = [item["id"] for item in items]
+    metadata_map = metadata_svc.get_metadata_map(ids) if ids else {}
+
+    for item in items:
+        is_folder = item.get("mimeType") == DRIVE_FOLDER_MIME_TYPE
         inferred = None if is_folder else _extract_validity_from_filename(item.get("name", ""))
         if inferred is not None or item["id"] not in metadata_map:
             metadata_map[item["id"]] = metadata_svc.apply_auto_validity_from_filename(
@@ -289,23 +455,40 @@ def _apply_metadata_to_items(items: list[dict[str, Any]]) -> dict[str, dict[str,
     return metadata_map
 
 
-def list_items(path: str | None, *, page: int = 1, page_size: int = 50, search: str | None = None) -> dict[str, Any]:
+def list_items(
+    path: str | None,
+    *,
+    page: int = 1,
+    page_size: int = 50,
+    search: str | None = None,
+) -> dict[str, Any]:
     file_id = path_to_id(path or ROOT_PATH)
+    safe_page_size = min(max(int(page_size or 50), 1), 200)
+    safe_page = max(int(page or 1), 1)
+    search_text = (search or "").strip()
+    cache_key = f"{file_id}:{search_text}:{safe_page}:{safe_page_size}"
+
+    cached = _session_cache_get("google_drive_list_cache", cache_key, LIST_CACHE_TTL_SECONDS)
+    if cached:
+        return cached
+
     drive = service()
     query_parts = [f"'{file_id}' in parents", "trashed = false"]
-    if search:
-        safe_search = search.replace("'", "\\'")
+    if search_text:
+        safe_search = search_text.replace("'", "\\'")
         query_parts.append(f"name contains '{safe_search}'")
     query = " and ".join(query_parts)
-    token_key = f"google_drive_page_tokens:{file_id}:{search or ''}:{page_size}"
+
+    token_key = f"google_drive_page_tokens:{file_id}:{search_text}:{safe_page_size}"
     tokens = session.get(token_key, {})
-    page_token = tokens.get(str(page)) if page > 1 else None
+    page_token = tokens.get(str(safe_page)) if safe_page > 1 else None
+
     try:
         response = drive.files().list(
             q=query,
             fields="nextPageToken, files(id,name,mimeType,size,modifiedTime,webViewLink,parents)",
             orderBy="folder,name_natural",
-            pageSize=min(max(page_size, 1), 200),
+            pageSize=safe_page_size,
             pageToken=page_token,
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
@@ -315,34 +498,26 @@ def list_items(path: str | None, *, page: int = 1, page_size: int = 50, search: 
 
     next_token = response.get("nextPageToken")
     if next_token:
-        tokens[str(page + 1)] = next_token
+        tokens[str(safe_page + 1)] = next_token
         session[token_key] = tokens
 
     raw_items = response.get("files", [])
-    metadata_map = _apply_metadata_to_items(raw_items)
+    metadata_map = _metadata_for_list_items(raw_items)
     items = [_item_to_dict(item, metadata_map.get(item["id"])) for item in raw_items]
 
-    current_path = id_to_path(file_id)
-    parent_path = ROOT_PATH
-    if file_id != "root":
-        try:
-            current = drive.files().get(fileId=file_id, fields="parents", supportsAllDrives=True).execute()
-            parents = current.get("parents") or []
-            if parents:
-                parent_path = id_to_path(parents[0])
-        except HttpError:
-            parent_path = ROOT_PATH
-    return {
+    result = {
         "items": items,
-        "current_path": current_path,
-        "parent_path": parent_path,
+        "current_path": id_to_path(file_id),
+        "parent_path": _parent_path_for(file_id, raw_items),
         "total": len(items),
-        "page": page,
-        "page_size": page_size,
+        "page": safe_page,
+        "page_size": safe_page_size,
         "has_more": bool(next_token),
         "breadcrumbs": _breadcrumbs_for(file_id),
         "source": "google_drive",
     }
+    _session_cache_set("google_drive_list_cache", cache_key, result)
+    return result
 
 
 def get_details(path: str) -> dict[str, Any]:
@@ -356,6 +531,7 @@ def get_details(path: str) -> dict[str, Any]:
         ).execute()
     except HttpError as exc:
         raise GoogleDriveError(f"Erro ao abrir detalhes do Google Drive: {exc}") from exc
+
     metadata_map = _apply_metadata_to_items([item])
     meta = metadata_map.get(file_id, {})
     data = _item_to_dict(item, meta)
@@ -367,6 +543,7 @@ def get_details(path: str) -> dict[str, Any]:
             "download_url": item.get("webContentLink"),
         }
     )
+
     validity_date = meta.get("validity_date")
     if isinstance(validity_date, str):
         validity_date = parse_validity_date(validity_date)
@@ -377,12 +554,18 @@ def get_details(path: str) -> dict[str, Any]:
     return data
 
 
-def set_validity(path: str, validity_type: str, validity_value: str | None, warning_days: int | None) -> dict[str, Any]:
+def set_validity(
+    path: str,
+    validity_type: str,
+    validity_value: str | None,
+    warning_days: int | None,
+) -> dict[str, Any]:
     file_id = path_to_id(path)
     validity_date = None
     if validity_type == "defined":
         validity_date = normalise_validity_input(validity_value)
     meta = metadata_svc.set_validity(file_id, validity_type, validity_date, warning_days)
+    _invalidate_drive_list_cache()
     status = _status_dict(meta)
     return {
         "status": status,
@@ -396,16 +579,22 @@ def set_validity(path: str, validity_type: str, validity_value: str | None, warn
 def set_notes(path: str, notes: str) -> dict[str, Any]:
     file_id = path_to_id(path)
     meta = metadata_svc.set_notes(file_id, notes)
+    _invalidate_drive_list_cache()
     return {"notes": meta.get("notes", "")}
 
 
 def set_auctions(path: str, auctions: str) -> dict[str, Any]:
     file_id = path_to_id(path)
     meta = metadata_svc.set_auctions(file_id, auctions)
+    _invalidate_drive_list_cache()
     return {"auctions": meta.get("auctions", ""), "pregoes": meta.get("auctions", "")}
 
 
-def export_directory_snapshot(path: str, sort_by: str = "name", sort_direction: str = "asc") -> tuple[str, bytes]:
+def export_directory_snapshot(
+    path: str,
+    sort_by: str = "name",
+    sort_direction: str = "asc",
+) -> tuple[str, bytes]:
     collected: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -414,9 +603,12 @@ def export_directory_snapshot(path: str, sort_by: str = "name", sort_direction: 
         if not result.get("has_more"):
             break
         page += 1
+
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
-    writer.writerow(["Nome", "Caminho", "Tipo", "Validade", "Status", "Observacoes", "Favorito", "Pregoes", "Origem validade"])
+    writer.writerow(
+        ["Nome", "Caminho", "Tipo", "Validade", "Status", "Observacoes", "Favorito", "Pregoes", "Origem validade"]
+    )
     for item in collected:
         writer.writerow(
             [
@@ -442,13 +634,21 @@ def create_folder(parent_path: str, name: str) -> dict[str, Any]:
     drive = service()
     try:
         item = drive.files().create(
-            body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
+            body={"name": name, "mimeType": DRIVE_FOLDER_MIME_TYPE, "parents": [parent_id]},
             fields="id,name,mimeType,modifiedTime,webViewLink,parents",
             supportsAllDrives=True,
         ).execute()
     except HttpError as exc:
         raise GoogleDriveError(f"Sem permissao ou falha ao criar pasta no Drive: {exc}") from exc
-    metadata_svc.touch_file(item["id"], file_name=item.get("name", name), source_uri=id_to_path(item["id"]), mime_type=item.get("mimeType", ""), web_url=item.get("webViewLink", ""))
+
+    metadata_svc.touch_file(
+        item["id"],
+        file_name=item.get("name", name),
+        source_uri=id_to_path(item["id"]),
+        mime_type=item.get("mimeType", ""),
+        web_url=item.get("webViewLink", ""),
+    )
+    _clear_drive_session_caches()
     return _item_to_dict(item, metadata_svc.get_metadata(item["id"]))
 
 
@@ -464,7 +664,15 @@ def rename_item(path: str, new_name: str) -> dict[str, Any]:
         ).execute()
     except HttpError as exc:
         raise GoogleDriveError(f"Sem permissao ou falha ao renomear item do Drive: {exc}") from exc
-    metadata_svc.touch_file(file_id, file_name=item.get("name", new_name), source_uri=id_to_path(file_id), mime_type=item.get("mimeType", ""), web_url=item.get("webViewLink", ""))
+
+    metadata_svc.touch_file(
+        file_id,
+        file_name=item.get("name", new_name),
+        source_uri=id_to_path(file_id),
+        mime_type=item.get("mimeType", ""),
+        web_url=item.get("webViewLink", ""),
+    )
+    _clear_drive_session_caches()
     return {"path": id_to_path(file_id), "name": item.get("name", new_name)}
 
 
@@ -478,6 +686,7 @@ def delete_items(paths: list[str]) -> int:
         except HttpError as exc:
             raise GoogleDriveError(f"Sem permissao ou falha ao excluir item do Drive: {exc}") from exc
         count += 1
+    _clear_drive_session_caches()
     return count
 
 
@@ -500,6 +709,7 @@ def move_items(paths: list[str], destination: str) -> dict[str, Any]:
         except HttpError as exc:
             raise GoogleDriveError(f"Sem permissao ou falha ao mover item do Drive: {exc}") from exc
         moved.append(id_to_path(file_id))
+    _clear_drive_session_caches()
     return {"items": moved}
 
 
@@ -511,7 +721,7 @@ def copy_items(paths: list[str], destination: str) -> dict[str, Any]:
         file_id = path_to_id(path)
         try:
             original = drive.files().get(fileId=file_id, fields="name,mimeType", supportsAllDrives=True).execute()
-            if original.get("mimeType") == "application/vnd.google-apps.folder":
+            if original.get("mimeType") == DRIVE_FOLDER_MIME_TYPE:
                 raise GoogleDriveError("Copiar pastas do Google Drive ainda nao e suportado pela API do app.")
             new_item = drive.files().copy(
                 fileId=file_id,
@@ -522,4 +732,5 @@ def copy_items(paths: list[str], destination: str) -> dict[str, Any]:
         except HttpError as exc:
             raise GoogleDriveError(f"Sem permissao ou falha ao copiar item do Drive: {exc}") from exc
         copied.append(id_to_path(new_item["id"]))
+    _clear_drive_session_caches()
     return {"items": copied}

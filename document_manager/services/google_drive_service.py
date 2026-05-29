@@ -14,6 +14,7 @@ import io
 import os
 import re
 import time
+import warnings
 from datetime import date, datetime
 from typing import Any, Optional
 from urllib.parse import quote, unquote
@@ -34,7 +35,7 @@ from ..status import (
 from . import drive_metadata_service as metadata_svc
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-REQUIRED_WRITE_SCOPE = "https://www.googleapis.com/auth/drive"
+OPTIONAL_GRANTED_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 DRIVE_PREFIX = "gdrive://"
 ROOT_PATH = "gdrive://root"
 DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -108,12 +109,20 @@ def finish_authorization(authorization_response: str, state: str | None) -> None
     if code_verifier:
         flow.code_verifier = code_verifier
 
-    # Google can return already-granted scopes together with the requested scope
-    # (for example: drive + drive.readonly). oauthlib treats that as a Warning
-    # exception unless this relaxation is enabled, which breaks the callback.
-    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
-    flow.fetch_token(authorization_response=authorization_response)
+    # Google can return previously granted scopes together with the requested Drive
+    # scope when include_granted_scopes=True. requests-oauthlib raises a Warning
+    # as an exception in that case (for example: drive -> drive drive.readonly).
+    # Accept this additive scope response and continue using the returned token.
+    try:
+        flow.fetch_token(authorization_response=authorization_response)
+    except Warning as exc:
+        message = str(exc)
+        if "Scope has changed" not in message:
+            raise
+        warnings.warn(message, stacklevel=2)
     credentials = flow.credentials
+    if not credentials or not credentials.token:
+        raise GoogleDriveError("Falha ao concluir autorizacao do Google Drive. Tente conectar novamente.")
     session["google_drive_credentials"] = credentials_to_dict(credentials)
     session.pop("google_oauth_state", None)
     session.pop("google_oauth_code_verifier", None)
@@ -136,13 +145,13 @@ def credentials_from_session() -> Credentials | None:
     if not data:
         return None
 
-    scopes = data.get("scopes") or []
-    if REQUIRED_WRITE_SCOPE not in scopes:
+    granted_scopes = set(data.get("scopes") or [])
+    required_scopes = set(SCOPES)
+    if not required_scopes.issubset(granted_scopes):
         session.pop("google_drive_credentials", None)
         _clear_drive_session_caches()
         raise GoogleDriveError(
-            "Permissoes do Google Drive desatualizadas. "
-            "Desconecte e conecte novamente sua conta Google aceitando as permissoes solicitadas."
+            "Permissoes do Google Drive desatualizadas. Desconecte e conecte novamente sua conta Google."
         )
 
     return Credentials(**data)
@@ -796,6 +805,98 @@ def move_items(paths: list[str], destination: str) -> dict[str, Any]:
     return {"items": moved}
 
 
+def _list_folder_children_for_copy(drive: Any, folder_id: str) -> list[dict[str, Any]]:
+    children: list[dict[str, Any]] = []
+    page_token: str | None = None
+    query = f"'{folder_id}' in parents and trashed = false"
+
+    while True:
+        response = drive.files().list(
+            q=query,
+            fields="nextPageToken, files(id,name,mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        children.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return children
+
+
+def _is_folder_inside(drive: Any, folder_id: str, possible_parent_id: str) -> bool:
+    if not folder_id or folder_id == "root":
+        return False
+    if folder_id == possible_parent_id:
+        return True
+
+    current_id = folder_id
+    visited: set[str] = set()
+    while current_id and current_id != "root" and current_id not in visited:
+        visited.add(current_id)
+        current = drive.files().get(
+            fileId=current_id,
+            fields="id,parents",
+            supportsAllDrives=True,
+        ).execute()
+        parents = current.get("parents", [])
+        if possible_parent_id in parents:
+            return True
+        current_id = parents[0] if parents else ""
+    return False
+
+
+def _copy_drive_item_recursive(drive: Any, file_id: str, destination_id: str) -> str:
+    original = drive.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType",
+        supportsAllDrives=True,
+    ).execute()
+
+    name = original.get("name") or "Sem nome"
+    mime_type = original.get("mimeType") or ""
+
+    if mime_type == DRIVE_FOLDER_MIME_TYPE:
+        if _is_folder_inside(drive, destination_id, file_id):
+            raise GoogleDriveError("Nao e possivel copiar uma pasta para dentro dela mesma ou de uma subpasta dela.")
+
+        new_folder = drive.files().create(
+            body={"name": name, "mimeType": DRIVE_FOLDER_MIME_TYPE, "parents": [destination_id]},
+            fields="id,name,mimeType,modifiedTime,webViewLink,parents",
+            supportsAllDrives=True,
+        ).execute()
+        metadata_svc.touch_file(
+            new_folder["id"],
+            file_name=new_folder.get("name", name),
+            source_uri=id_to_path(new_folder["id"]),
+            mime_type=new_folder.get("mimeType", DRIVE_FOLDER_MIME_TYPE),
+            web_url=new_folder.get("webViewLink", ""),
+        )
+
+        for child in _list_folder_children_for_copy(drive, file_id):
+            _copy_drive_item_recursive(drive, child["id"], new_folder["id"])
+
+        return id_to_path(new_folder["id"])
+
+    new_item = drive.files().copy(
+        fileId=file_id,
+        body={"name": name, "parents": [destination_id]},
+        fields="id,name,mimeType,size,modifiedTime,webViewLink,parents",
+        supportsAllDrives=True,
+    ).execute()
+    metadata_svc.touch_file(
+        new_item["id"],
+        file_name=new_item.get("name", name),
+        source_uri=id_to_path(new_item["id"]),
+        mime_type=new_item.get("mimeType", ""),
+        web_url=new_item.get("webViewLink", ""),
+    )
+    return id_to_path(new_item["id"])
+
+
 def copy_items(paths: list[str], destination: str) -> dict[str, Any]:
     drive = service()
     dest_id = path_to_id(destination)
@@ -803,17 +904,10 @@ def copy_items(paths: list[str], destination: str) -> dict[str, Any]:
     for path in paths:
         file_id = path_to_id(path)
         try:
-            original = drive.files().get(fileId=file_id, fields="name,mimeType", supportsAllDrives=True).execute()
-            if original.get("mimeType") == DRIVE_FOLDER_MIME_TYPE:
-                raise GoogleDriveError("Copiar pastas do Google Drive ainda nao e suportado pela API do app.")
-            new_item = drive.files().copy(
-                fileId=file_id,
-                body={"name": original.get("name"), "parents": [dest_id]},
-                fields="id,name,mimeType,webViewLink",
-                supportsAllDrives=True,
-            ).execute()
+            copied.append(_copy_drive_item_recursive(drive, file_id, dest_id))
+        except GoogleDriveError:
+            raise
         except HttpError as exc:
             raise GoogleDriveError(f"Sem permissao ou falha ao copiar item do Drive: {exc}") from exc
-        copied.append(id_to_path(new_item["id"]))
     _clear_drive_session_caches()
     return {"items": copied}

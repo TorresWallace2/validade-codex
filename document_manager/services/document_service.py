@@ -919,21 +919,32 @@ def add_favorite(username: str, name: str, path_str: str) -> dict[str, object]:
     if not name.strip():
         raise DocumentServiceError('Informe um nome para o favorito.')
 
-    path = normalize_path(path_str)
-    _ensure_accessible(path)
-    if not path.is_dir():
-        raise DocumentServiceError('Somente pastas podem ser adicionadas aos favoritos.')
+    raw_path = (path_str or '').strip()
+    if not raw_path:
+        raise DocumentServiceError('Informe o caminho do favorito.')
+
+    # Favoritos do Google Drive usam caminhos virtuais, exemplo:
+    # gdrive://root ou gdrive://<id-da-pasta>. Eles nao existem no disco
+    # do Render, entao nao podem passar pela validacao de Path local.
+    if raw_path.startswith('gdrive://'):
+        favorite_path = raw_path
+    else:
+        path = normalize_path(raw_path)
+        _ensure_accessible(path)
+        if not path.is_dir():
+            raise DocumentServiceError('Somente pastas podem ser adicionadas aos favoritos.')
+        favorite_path = str(path)
 
     user_id = _require_user_id(username)
     try:
         db.execute(
             "INSERT INTO favorites(user_id, name, path, created_at) VALUES(?, ?, ?, ?)",
-            (user_id, name, str(path), datetime.utcnow().isoformat(timespec="seconds")),
+            (user_id, name, favorite_path, datetime.utcnow().isoformat(timespec="seconds")),
         )
     except sqlite3.IntegrityError as exc:
         raise DocumentServiceError('Favorito ja existe para este usuario.') from exc
 
-    return {"id": None, "name": name, "path": str(path)}
+    return {"id": None, "name": name, "path": favorite_path}
 
 
 def delete_favorite(username: str, name: str) -> None:

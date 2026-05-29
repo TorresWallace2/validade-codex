@@ -1,4 +1,4 @@
-﻿"""Application factory for the document manager."""
+"""Application factory for the document manager."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,6 +13,7 @@ from .auth import init_auth
 from .blueprints.auth import auth_bp
 from .blueprints.api import api_bp
 from .blueprints.ui import ui_bp
+from .blueprints.google_drive import google_drive_bp
 
 
 def create_app() -> Flask:
@@ -36,5 +37,6 @@ def create_app() -> Flask:
     app.register_blueprint(auth_bp)
     app.register_blueprint(ui_bp)
     app.register_blueprint(api_bp, url_prefix="/api")
+    app.register_blueprint(google_drive_bp)
 
     return app

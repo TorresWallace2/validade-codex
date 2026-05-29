@@ -1,4 +1,4 @@
-﻿"""REST API blueprint for document management operations."""
+"""REST API blueprint for document management operations."""
 from __future__ import annotations
 
 import io
@@ -9,6 +9,7 @@ from flask import Blueprint, Response, jsonify, make_response, request, send_fil
 
 from ..services import document_service as svc
 from ..services import auth_service
+from ..services import google_drive_service as drive_svc
 
 api_bp = Blueprint("api", __name__)
 
@@ -180,6 +181,14 @@ def list_items() -> Response:
     status_filter = status_filter_param.split(",") if status_filter_param else None
 
     try:
+        if drive_svc.is_drive_path(path):
+            data = drive_svc.list_items(
+                path,
+                page=page,
+                page_size=page_size_int or 50,
+                search=search,
+            )
+            return _json_success({"data": data})
         data = svc.list_directory_items(
             path if path else None,
             sort_by=sort_by,
@@ -190,6 +199,8 @@ def list_items() -> Response:
             status_filter=status_filter,
         )
         return _json_success({"data": data})
+    except drive_svc.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
     except svc.DocumentServiceError as exc:
         return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
     except Exception as exc:  # pragma: no cover - unexpected errors
@@ -230,8 +241,13 @@ def details() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
+        if drive_svc.is_drive_path(path):
+            data = drive_svc.get_details(path)
+            return _json_success({"data": data})
         data = svc.get_details(path)
         return _json_success({"data": data})
+    except drive_svc.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
     except svc.DocumentServiceError as exc:
         return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
 
@@ -409,8 +425,13 @@ def open_file() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
+        if drive_svc.is_drive_path(path):
+            data = drive_svc.get_details(path)
+            return _json_success({"data": {"url": data.get("web_url")}})
         svc.open_with_system(path)
         return _json_success()
+    except drive_svc.GoogleDriveError as exc:
+        return _json_error(str(exc))
     except svc.DocumentServiceError as exc:
         return _json_error(str(exc))
 
@@ -422,8 +443,13 @@ def open_folder() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
+        if drive_svc.is_drive_path(path):
+            data = drive_svc.get_details(path)
+            return _json_success({"data": {"url": data.get("web_url")}})
         svc.open_in_explorer(path)
         return _json_success()
+    except drive_svc.GoogleDriveError as exc:
+        return _json_error(str(exc))
     except svc.DocumentServiceError as exc:
         return _json_error(str(exc))
 

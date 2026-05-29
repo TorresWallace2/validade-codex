@@ -1,4 +1,4 @@
-﻿const originalFetch = window.fetch;
+const originalFetch = window.fetch;
 window.fetch = async (...args) => {
   const response = await originalFetch(...args);
   if (response.status === 401) {
@@ -34,6 +34,8 @@ const state = {
   transferParentPath: '',
   currentUser: null,
   userList: [],
+  googleDriveConnected: false,
+  googleDriveRootPath: 'gdrive://root',
 };
 
 const elements = {};
@@ -60,6 +62,8 @@ function cacheElements() {
   elements.btnGoAddress = document.getElementById('btnGoAddress');
   elements.btnNavigateUp = document.getElementById('btnNavigateUp');
   elements.darkModeToggle = document.getElementById('darkModeToggle');
+  elements.btnGoogleDrive = document.getElementById('btnGoogleDrive');
+  elements.btnDisconnectGoogleDrive = document.getElementById('btnDisconnectGoogleDrive');
   elements.searchInput = document.getElementById('searchInput');
   elements.btnClearSearch = document.getElementById('btnClearSearch');
   elements.btnApplyStatus = document.getElementById('btnApplyStatus');
@@ -233,6 +237,12 @@ function setupListeners() {
   if (elements.btnManageUsers) {
     elements.btnManageUsers.addEventListener('click', openUserManager);
   }
+  if (elements.btnGoogleDrive) {
+    elements.btnGoogleDrive.addEventListener('click', handleGoogleDriveButton);
+  }
+  if (elements.btnDisconnectGoogleDrive) {
+    elements.btnDisconnectGoogleDrive.addEventListener('click', disconnectGoogleDrive);
+  }
   if (elements.userCreateForm) {
     elements.userCreateForm.addEventListener('submit', handleUserCreate);
   }
@@ -370,7 +380,9 @@ function attachSentinel() {
 async function bootstrapApp() {
   cacheElements();
   await fetchSession();
+  await fetchGoogleDriveStatus();
   updateUserBanner();
+  updateGoogleDriveButtons();
   updatePregaoSelectionButton();
   updateFavoriteSelectionButton();
   setupModals();
@@ -391,6 +403,13 @@ function restorePreferences() {
   document.documentElement.setAttribute('data-bs-theme', theme);
   elements.darkModeToggle.checked = theme === 'dark';
 
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('drive') === 'connected') {
+    state.currentPath = state.googleDriveRootPath;
+    localStorage.setItem('docmgr-last-path', state.currentPath);
+    window.history.replaceState({}, document.title, window.location.pathname);
+    return;
+  }
   const lastPath = localStorage.getItem('docmgr-last-path');
   if (lastPath) {
     state.currentPath = lastPath;
@@ -443,6 +462,58 @@ function toggleValidityDateGroup() {
 }
 
 
+
+
+function isGoogleDrivePath(path = state.currentPath) {
+  return Boolean(path && path.startsWith('gdrive://'));
+}
+
+async function fetchGoogleDriveStatus() {
+  try {
+    const response = await fetch('/api/google-drive/status');
+    const payload = await response.json();
+    if (payload.success && payload.data) {
+      state.googleDriveConnected = Boolean(payload.data.connected);
+      state.googleDriveRootPath = payload.data.root_path || 'gdrive://root';
+    }
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function updateGoogleDriveButtons() {
+  if (elements.btnGoogleDrive) {
+    elements.btnGoogleDrive.innerHTML = state.googleDriveConnected
+      ? '<i class="bi bi-google me-1"></i>Abrir Google Drive'
+      : '<i class="bi bi-google me-1"></i>Conectar Google Drive';
+  }
+  if (elements.btnDisconnectGoogleDrive) {
+    elements.btnDisconnectGoogleDrive.classList.toggle('d-none', !state.googleDriveConnected);
+  }
+}
+
+function handleGoogleDriveButton() {
+  if (!state.googleDriveConnected) {
+    window.location.href = '/auth/google/connect';
+    return;
+  }
+  state.currentPath = state.googleDriveRootPath;
+  if (elements.addressInput) {
+    elements.addressInput.value = state.currentPath;
+  }
+  reloadDirectory(true);
+}
+
+async function disconnectGoogleDrive() {
+  try {
+    await fetch('/api/google-drive/disconnect', { method: 'POST' });
+  } catch (error) {
+    console.error(error);
+  }
+  state.googleDriveConnected = false;
+  updateGoogleDriveButtons();
+  showToast('Google Drive desconectado.', 'info');
+}
 
 async function fetchSession() {
   try {
@@ -699,6 +770,9 @@ async function loadDirectory(reset = false, options = {}) {
       state.currentPath = currentPath;
     }
     state.parentPath = parentPath;
+    if (elements.addressInput) {
+      elements.addressInput.value = state.currentPath;
+    }
     localStorage.setItem('docmgr-last-path', state.currentPath);
 
     if (reset) {
@@ -1276,6 +1350,7 @@ function clearDetails() {
 }
 
 function updateActionButtons() {
+  const driveMode = isGoogleDrivePath();
   const enabled = Boolean(state.selectedPath);
   [
     elements.btnSaveNotes,
@@ -1292,12 +1367,50 @@ function updateActionButtons() {
     }
   });
 
+  if (driveMode) {
+    [
+      elements.btnSaveNotes,
+      elements.btnResetNotes,
+      elements.btnSetValidity,
+      elements.btnMarkIndeterminate,
+      elements.btnClearValidity,
+      elements.btnRename,
+      elements.btnMove,
+      elements.btnCopy,
+      elements.btnDelete,
+      elements.btnUpload,
+      elements.btnNewFolder,
+      elements.btnNewFile,
+      elements.btnExport,
+    ].forEach((button) => {
+      if (button) button.disabled = true;
+    });
+  } else {
+    [
+      elements.btnMove,
+      elements.btnCopy,
+      elements.btnUpload,
+      elements.btnNewFolder,
+      elements.btnNewFile,
+      elements.btnExport,
+    ].forEach((button) => {
+      if (button) button.disabled = false;
+    });
+  }
+
   if (elements.btnOpenFile) {
     elements.btnOpenFile.disabled = !enabled || state.selectedType !== 'file';
+  }
+  if (elements.btnOpenFolder) {
+    elements.btnOpenFolder.disabled = !enabled || state.selectedType !== 'directory';
   }
 }
 
 async function saveNotes() {
+  if (isGoogleDrivePath()) {
+    showToast('Observacoes em arquivos do Google Drive ainda nao estao habilitadas.', 'info');
+    return;
+  }
   if (!state.selectedPath) {
     return;
   }
@@ -1338,6 +1451,11 @@ async function triggerSimpleAction(endpoint) {
     if (!response.ok || !payload.success) {
       throw new Error(payload.error || 'Falha ao executar ação.');
     }
+    if (payload?.data?.url) {
+      window.open(payload.data.url, '_blank', 'noopener');
+      showToast('Aberto no Google Drive.', 'success');
+      return;
+    }
     showToast('Ação executada com sucesso.', 'success');
   } catch (error) {
     console.error(error);
@@ -1346,6 +1464,10 @@ async function triggerSimpleAction(endpoint) {
 }
 
 async function quickValidity(type) {
+  if (isGoogleDrivePath()) {
+    showToast('Validade em arquivos do Google Drive ainda nao esta habilitada.', 'info');
+    return;
+  }
   const paths = getValidityTargetPaths();
   if (paths.length === 0) {
     showToast('Selecione ao menos um item para atualizar a validade.', 'warning');
@@ -1400,6 +1522,10 @@ async function quickValidity(type) {
 }
 
 async function submitValidity() {
+  if (isGoogleDrivePath()) {
+    showToast('Validade em arquivos do Google Drive ainda nao esta habilitada.', 'info');
+    return;
+  }
   if (!state.selectedPath) {
     return;
   }
@@ -1440,6 +1566,10 @@ async function submitValidity() {
 }
 
 async function submitRename() {
+  if (isGoogleDrivePath()) {
+    showToast('Renomear no Google Drive ainda nao esta habilitado.', 'info');
+    return;
+  }
   if (!state.selectedPath) {
     return;
   }
@@ -1475,6 +1605,10 @@ async function submitRename() {
 }
 
 async function submitCreateFolder() {
+  if (isGoogleDrivePath()) {
+    showToast('Criar pasta no Google Drive ainda nao esta habilitado.', 'info');
+    return;
+  }
   const name = elements.newFolderName.value.trim();
   if (!name) {
     showToast('Informe o nome da pasta.', 'warning');
@@ -1500,6 +1634,10 @@ async function submitCreateFolder() {
 }
 
 async function submitCreateFile() {
+  if (isGoogleDrivePath()) {
+    showToast('Criar arquivo no Google Drive ainda nao esta habilitado.', 'info');
+    return;
+  }
   const name = elements.newFileName.value.trim();
   if (!name) {
     showToast('Informe o nome do arquivo.', 'warning');
@@ -1525,6 +1663,10 @@ async function submitCreateFile() {
 }
 
 async function submitUpload() {
+  if (isGoogleDrivePath()) {
+    showToast('Upload direto para Google Drive ainda nao esta habilitado.', 'info');
+    return;
+  }
   const files = elements.uploadInput.files;
   if (!files || files.length === 0) {
     showToast('Selecione ao menos um arquivo.', 'warning');
@@ -1608,6 +1750,10 @@ function applyStatusFilter() {
 }
 
 async function handleExport() {
+  if (isGoogleDrivePath()) {
+    showToast('Exportar CSV do Google Drive ainda nao esta habilitado.', 'info');
+    return;
+  }
   if (!state.currentPath) {
     return;
   }

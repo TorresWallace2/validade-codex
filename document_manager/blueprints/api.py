@@ -202,7 +202,11 @@ def list_items() -> Response:
     try:
         if drive_svc.is_drive_path(path):
             data = drive_svc.list_items(
-                path, page=page, page_size=page_size_int or 50, search=search
+                path,
+                page=page,
+                page_size=page_size_int or 50,
+                search=search,
+                status_filter=status_filter,
             )
             return _json_success({"data": data})
         data = svc.list_directory_items(
@@ -238,7 +242,11 @@ def navigate() -> Response:
     try:
         if drive_svc.is_drive_path(path):
             data = drive_svc.list_items(
-                path, page=1, page_size=page_size_int or 50, search=search
+                path,
+                page=1,
+                page_size=page_size_int or 50,
+                search=search,
+                status_filter=status_filter,
             )
             return _json_success({"data": data})
         data = svc.navigate_to_path(

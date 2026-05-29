@@ -16,7 +16,7 @@ import re
 import time
 import warnings
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any, Sequence, Optional
 from urllib.parse import quote, unquote
 
 from flask import current_app, session
@@ -480,18 +480,27 @@ def _apply_metadata_to_items(items: list[dict[str, Any]]) -> dict[str, dict[str,
     return metadata_map
 
 
+def _resolve_status_filter(status_filter: Sequence[str] | None) -> set[str]:
+    if not status_filter:
+        return set()
+    return {str(code).strip().lower() for code in status_filter if str(code).strip()}
+
+
 def list_items(
     path: str | None,
     *,
     page: int = 1,
     page_size: int = 50,
     search: str | None = None,
+    status_filter: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     file_id = path_to_id(path or ROOT_PATH)
     safe_page_size = min(max(int(page_size or 50), 1), 200)
     safe_page = max(int(page or 1), 1)
     search_text = (search or "").strip()
-    cache_key = f"{file_id}:{search_text}:{safe_page}:{safe_page_size}"
+    status_allowed = _resolve_status_filter(status_filter)
+    status_key = ",".join(sorted(status_allowed))
+    cache_key = f"{file_id}:{search_text}:{status_key}:{safe_page}:{safe_page_size}"
 
     cached = _session_cache_get("google_drive_list_cache", cache_key, LIST_CACHE_TTL_SECONDS)
     if cached:
@@ -500,50 +509,79 @@ def list_items(
     drive = service()
     query_parts = [f"'{file_id}' in parents", "trashed = false"]
     if search_text:
-        safe_search = search_text.replace("'", "\\'")
+        safe_search = search_text.replace("'", "\'")
         query_parts.append(f"name contains '{safe_search}'")
     query = " and ".join(query_parts)
 
-    token_key = f"google_drive_page_tokens:{file_id}:{search_text}:{safe_page_size}"
-    tokens = session.get(token_key, {})
-    page_token = tokens.get(str(safe_page)) if safe_page > 1 else None
-
     try:
-        response = drive.files().list(
-            q=query,
-            fields="nextPageToken, files(id,name,mimeType,size,modifiedTime,webViewLink,parents)",
-            orderBy="folder,name_natural",
-            pageSize=safe_page_size,
-            pageToken=page_token,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
+        if status_allowed:
+            # Status is stored in the app metadata, not in Google Drive itself.
+            # Therefore we must fetch all files from the folder, apply the status
+            # filter locally, and only then paginate the filtered result.
+            raw_items = []
+            next_token = None
+            while True:
+                response = drive.files().list(
+                    q=query,
+                    fields="nextPageToken, files(id,name,mimeType,size,modifiedTime,webViewLink,parents)",
+                    orderBy="folder,name_natural",
+                    pageSize=200,
+                    pageToken=next_token,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                ).execute()
+                raw_items.extend(response.get("files", []))
+                next_token = response.get("nextPageToken")
+                if not next_token:
+                    break
+        else:
+            token_key = f"google_drive_page_tokens:{file_id}:{search_text}:{safe_page_size}"
+            tokens = session.get(token_key, {})
+            page_token = tokens.get(str(safe_page)) if safe_page > 1 else None
+            response = drive.files().list(
+                q=query,
+                fields="nextPageToken, files(id,name,mimeType,size,modifiedTime,webViewLink,parents)",
+                orderBy="folder,name_natural",
+                pageSize=safe_page_size,
+                pageToken=page_token,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute()
+            next_token = response.get("nextPageToken")
+            if next_token:
+                tokens[str(safe_page + 1)] = next_token
+                session[token_key] = tokens
+            raw_items = response.get("files", [])
     except HttpError as exc:
         raise GoogleDriveError(f"Erro ao listar Google Drive: {exc}") from exc
 
-    next_token = response.get("nextPageToken")
-    if next_token:
-        tokens[str(safe_page + 1)] = next_token
-        session[token_key] = tokens
-
-    raw_items = response.get("files", [])
     metadata_map = _metadata_for_list_items(raw_items)
     items = [_item_to_dict(item, metadata_map.get(item["id"])) for item in raw_items]
+    if status_allowed:
+        items = [item for item in items if item.get("status", {}).get("code") in status_allowed]
+        total_items = len(items)
+        start = (safe_page - 1) * safe_page_size
+        end = start + safe_page_size
+        page_items = items[start:end]
+        has_more = end < total_items
+    else:
+        total_items = len(items)
+        page_items = items
+        has_more = bool(next_token)
 
     result = {
-        "items": items,
+        "items": page_items,
         "current_path": id_to_path(file_id),
         "parent_path": _parent_path_for(file_id, raw_items),
-        "total": len(items),
+        "total": total_items,
         "page": safe_page,
         "page_size": safe_page_size,
-        "has_more": bool(next_token),
+        "has_more": has_more,
         "breadcrumbs": _breadcrumbs_for(file_id),
         "source": "google_drive",
     }
     _session_cache_set("google_drive_list_cache", cache_key, result)
     return result
-
 
 def get_details(path: str) -> dict[str, Any]:
     file_id = path_to_id(path)

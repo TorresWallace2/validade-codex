@@ -875,20 +875,47 @@ def list_presets(username: str) -> list[dict[str, object]]:
     ]
 
 
+def _is_google_drive_virtual_path(raw_path: str) -> bool:
+    return raw_path.startswith('gdrive://') or raw_path.startswith('gdrive:/')
+
+
+def _normalize_google_drive_virtual_path(raw_path: str) -> str:
+    if raw_path.startswith('gdrive://'):
+        return raw_path
+    if raw_path.startswith('gdrive:/'):
+        return 'gdrive://' + raw_path[len('gdrive:/'):].lstrip('/')
+    return raw_path
+
+
 def add_preset(username: str, name: str, path_str: str) -> dict[str, object]:
-    path = normalize_path(path_str)
-    _ensure_accessible(path)
-    if not path.is_dir():
-        raise DocumentServiceError('Somente pastas podem ser salvas como preset.')
+    if not name.strip():
+        raise DocumentServiceError('Informe um nome para o pregao.')
+
+    raw_path = (path_str or '').strip()
+    if not raw_path:
+        raise DocumentServiceError('Informe o caminho do pregao.')
+
+    # Pregoes do Google Drive usam caminhos virtuais, exemplo:
+    # gdrive://root ou gdrive://<id-da-pasta>. Eles nao existem no disco
+    # do Render, entao nao podem passar pela validacao de Path local.
+    if _is_google_drive_virtual_path(raw_path):
+        preset_path = _normalize_google_drive_virtual_path(raw_path)
+    else:
+        path = normalize_path(raw_path)
+        _ensure_accessible(path)
+        if not path.is_dir():
+            raise DocumentServiceError('Somente pastas podem ser salvas como preset.')
+        preset_path = str(path)
+
     user_id = _require_user_id(username)
     try:
         db.execute(
             "INSERT INTO presets(user_id, name, path, created_at) VALUES(?, ?, ?, ?)",
-            (user_id, name, str(path), datetime.utcnow().isoformat(timespec="seconds")),
+            (user_id, name, preset_path, datetime.utcnow().isoformat(timespec="seconds")),
         )
     except sqlite3.IntegrityError as exc:
         raise DocumentServiceError('Preset ja existe para este usuario.') from exc
-    return {"name": name, "path": str(path)}
+    return {"name": name, "path": preset_path}
 
 
 def delete_preset(username: str, preset_id: int) -> None:
@@ -926,8 +953,8 @@ def add_favorite(username: str, name: str, path_str: str) -> dict[str, object]:
     # Favoritos do Google Drive usam caminhos virtuais, exemplo:
     # gdrive://root ou gdrive://<id-da-pasta>. Eles nao existem no disco
     # do Render, entao nao podem passar pela validacao de Path local.
-    if raw_path.startswith('gdrive://'):
-        favorite_path = raw_path
+    if _is_google_drive_virtual_path(raw_path):
+        favorite_path = _normalize_google_drive_virtual_path(raw_path)
     else:
         path = normalize_path(raw_path)
         _ensure_accessible(path)

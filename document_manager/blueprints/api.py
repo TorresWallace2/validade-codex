@@ -7,8 +7,8 @@ from typing import Any
 
 from flask import Blueprint, Response, jsonify, make_response, request, send_file, session, g
 
-from ..services import document_service as svc
 from ..services import auth_service
+from ..services import document_service as svc
 from ..services import google_drive_service as drive_svc
 
 api_bp = Blueprint("api", __name__)
@@ -36,28 +36,25 @@ def _json_unauthorised(message: str = 'Autenticacao requerida.') -> Response:
     return _json_error(message, HTTPStatus.UNAUTHORIZED)
 
 
+def _is_drive(path: str | None) -> bool:
+    return drive_svc.is_drive_path(path)
+
+
 @api_bp.post("/auth/login")
 def auth_login() -> Response:
     payload = request.get_json(silent=True) or {}
     username = str(payload.get('username') or '').strip()
     password = str(payload.get('password') or '')
     remember = bool(payload.get('remember'))
-
     if not username or not password:
         return _json_error('Informe usuario e senha.')
     try:
         user = auth_service.authenticate(username, password)
     except auth_service.AuthServiceError as exc:
         return _json_error(str(exc), HTTPStatus.UNAUTHORIZED)
-
-    session['user'] = {
-        'username': user.username,
-        'role': user.role,
-        'is_admin': user.is_admin,
-    }
+    session['user'] = {'username': user.username, 'role': user.role, 'is_admin': user.is_admin}
     session['remember'] = remember
     session.permanent = True
-
     return _json_success({'data': session['user']})
 
 
@@ -84,17 +81,10 @@ def list_all_users() -> Response:
     if not user.get('is_admin'):
         return _json_error('Somente administradores podem listar usuarios.', HTTPStatus.FORBIDDEN)
     records = auth_service.list_users()
-    data = [
-        {
-            'id': item.id,
-            'username': item.username,
-            'role': item.role,
-            'is_active': item.is_active,
-            'created_at': item.created_at,
-            'updated_at': item.updated_at,
-        }
-        for item in records
-    ]
+    data = [item.__dict__ if hasattr(item, '__dict__') else {
+        'id': item.id, 'username': item.username, 'role': item.role,
+        'is_active': item.is_active, 'created_at': item.created_at, 'updated_at': item.updated_at,
+    } for item in records]
     return _json_success({'data': data})
 
 
@@ -105,42 +95,31 @@ def create_user() -> Response:
         return _json_unauthorised()
     if not user.get('is_admin'):
         return _json_error('Somente administradores podem criar usuarios.', HTTPStatus.FORBIDDEN)
-
     payload = request.get_json(silent=True) or {}
     username = str(payload.get('username') or '').strip()
     password = str(payload.get('password') or '')
     role = str(payload.get('role') or 'user').strip().lower()
-
     if not username or not password:
         return _json_error('Informe usuario e senha.')
     if role not in {'admin', 'user'}:
         return _json_error('Perfil invalido.')
-
     try:
         new_user = auth_service.create_user(username, password, role, created_by=user['username'])
     except auth_service.AuthServiceError as exc:
         return _json_error(str(exc))
-
-    data = {
-        'id': new_user.id,
-        'username': new_user.username,
-        'role': new_user.role,
-        'is_active': new_user.is_active,
-        'created_at': new_user.created_at,
-        'updated_at': new_user.updated_at,
-    }
-    return _json_success({'data': data}, HTTPStatus.CREATED)
+    return _json_success({'data': {
+        'id': new_user.id, 'username': new_user.username, 'role': new_user.role,
+        'is_active': new_user.is_active, 'created_at': new_user.created_at, 'updated_at': new_user.updated_at,
+    }}, HTTPStatus.CREATED)
 
 
-
-@api_bp.post("/users/<string:username>/status")
+@api_bp.post("/users/<username>/status")
 def update_user_status(username: str) -> Response:
     user = _current_user_dict()
     if not user:
         return _json_unauthorised()
     if not user.get('is_admin'):
         return _json_error('Somente administradores podem gerenciar usuarios.', HTTPStatus.FORBIDDEN)
-
     payload = request.get_json(silent=True) or {}
     active = bool(payload.get('active', True))
     try:
@@ -150,14 +129,13 @@ def update_user_status(username: str) -> Response:
     return _json_success({'data': {'username': username.upper(), 'active': active}})
 
 
-@api_bp.post("/users/<string:username>/password")
+@api_bp.post("/users/<username>/password")
 def update_user_password(username: str) -> Response:
     user = _current_user_dict()
     if not user:
         return _json_unauthorised()
     if not user.get('is_admin'):
         return _json_error('Somente administradores podem gerenciar usuarios.', HTTPStatus.FORBIDDEN)
-
     payload = request.get_json(silent=True) or {}
     new_password = str(payload.get('password') or '')
     if len(new_password) < 6:
@@ -167,6 +145,7 @@ def update_user_password(username: str) -> Response:
     except auth_service.AuthServiceError as exc:
         return _json_error(str(exc))
     return _json_success()
+
 
 @api_bp.get("/list_items")
 def list_items() -> Response:
@@ -179,31 +158,15 @@ def list_items() -> Response:
     search = request.args.get("search")
     status_filter_param = request.args.get("status")
     status_filter = status_filter_param.split(",") if status_filter_param else None
-
     try:
-        if drive_svc.is_drive_path(path):
-            data = drive_svc.list_items(
-                path,
-                page=page,
-                page_size=page_size_int or 50,
-                search=search,
-            )
-            return _json_success({"data": data})
-        data = svc.list_directory_items(
-            path if path else None,
-            sort_by=sort_by,
-            sort_direction=sort_direction,
-            page=page,
-            page_size=page_size_int,
-            search=search,
-            status_filter=status_filter,
-        )
+        if _is_drive(path):
+            data = drive_svc.list_items(path, page=page, page_size=page_size_int or 50, search=search)
+        else:
+            data = svc.list_directory_items(path if path else None, sort_by=sort_by, sort_direction=sort_direction, page=page, page_size=page_size_int, search=search, status_filter=status_filter)
         return _json_success({"data": data})
-    except drive_svc.GoogleDriveError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
-    except svc.DocumentServiceError as exc:
-        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
-    except Exception as exc:  # pragma: no cover - unexpected errors
+    except Exception as exc:
         return _json_error(f"Erro inesperado: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
@@ -213,25 +176,13 @@ def navigate() -> Response:
     path = payload.get("path")
     if not path:
         return _json_error("Informe o caminho.")
-
-    sort_by = payload.get("sort_by", "name")
-    sort_direction = payload.get("direction", "asc")
-    search = payload.get("search")
-    status_filter = payload.get("status")
-    page_size = payload.get("page_size")
-    page_size_int = int(page_size) if page_size else None
-
     try:
-        data = svc.navigate_to_path(
-            path,
-            sort_by=sort_by,
-            sort_direction=sort_direction,
-            search=search,
-            status_filter=status_filter,
-            page_size=page_size_int,
-        )
+        if _is_drive(path):
+            data = drive_svc.list_items(path, page=1, page_size=int(payload.get("page_size") or 50), search=payload.get("search"))
+        else:
+            data = svc.navigate_to_path(path, sort_by=payload.get("sort_by", "name"), sort_direction=payload.get("direction", "asc"), search=payload.get("search"), status_filter=payload.get("status"), page_size=payload.get("page_size"))
         return _json_success({"data": data})
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -241,14 +192,9 @@ def details() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
-        if drive_svc.is_drive_path(path):
-            data = drive_svc.get_details(path)
-            return _json_success({"data": data})
-        data = svc.get_details(path)
+        data = drive_svc.get_details(path) if _is_drive(path) else svc.get_details(path)
         return _json_success({"data": data})
-    except drive_svc.GoogleDriveError as exc:
-        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
 
 
@@ -260,16 +206,12 @@ def set_validity() -> Response:
     validity_value = payload.get("validity")
     warning_days = payload.get("warning_days")
     warning_days_int = int(warning_days) if warning_days else None
-
     if not path or not validity_type:
         return _json_error("Caminho e tipo de validade são obrigatórios.")
-
     try:
-        data = svc.set_validity(path, validity_type, validity_value, warning_days_int)
+        data = drive_svc.set_validity(path, validity_type, validity_value, warning_days_int) if _is_drive(path) else svc.set_validity(path, validity_type, validity_value, warning_days_int)
         return _json_success({"data": data})
-    except ValueError as exc:
-        return _json_error(str(exc))
-    except svc.DocumentServiceError as exc:
+    except (ValueError, drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -281,9 +223,9 @@ def set_notes() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
-        data = svc.set_notes(path, notes)
+        data = drive_svc.set_notes(path, notes) if _is_drive(path) else svc.set_notes(path, notes)
         return _json_success({"data": data})
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -295,9 +237,9 @@ def rename() -> Response:
     if not path or not new_name:
         return _json_error("Informe caminho e novo nome.")
     try:
-        data = svc.rename_item(path, new_name)
+        data = drive_svc.rename_item(path, new_name) if _is_drive(path) else svc.rename_item(path, new_name)
         return _json_success({"data": data})
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -305,28 +247,24 @@ def rename() -> Response:
 def delete() -> Response:
     payload = request.get_json(silent=True) or {}
     paths_payload = payload.get("paths")
-    paths: list[str] = []
-
     if paths_payload is not None:
         if not isinstance(paths_payload, list):
             return _json_error("Informe caminhos válidos.")
-        for item in paths_payload:
-            value = str(item).strip() if item is not None else ''
-            if value:
-                paths.append(value)
+        paths = [str(item).strip() for item in paths_payload if item]
     else:
-        path = payload.get("path")
-        if path:
-            paths.append(str(path).strip())
-
+        paths = [str(payload.get("path") or "").strip()]
     paths = [p for p in paths if p]
     if not paths:
         return _json_error("Informe ao menos um caminho.")
-
     try:
-        deleted = svc.delete_items(paths)
+        if any(_is_drive(p) for p in paths):
+            if not all(_is_drive(p) for p in paths):
+                return _json_error("Nao misture arquivos locais e Google Drive na mesma exclusao.")
+            deleted = drive_svc.delete_items(paths)
+        else:
+            deleted = svc.delete_items(paths)
         return _json_success({"data": {"deleted": deleted}})
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -338,9 +276,9 @@ def create_folder() -> Response:
     if not parent or not name:
         return _json_error("Informe pasta base e nome.")
     try:
-        data = svc.create_directory(parent, name)
+        data = drive_svc.create_directory(parent, name) if _is_drive(parent) else svc.create_directory(parent, name)
         return _json_success({"data": data}, HTTPStatus.CREATED)
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -352,9 +290,9 @@ def create_file() -> Response:
     if not parent or not name:
         return _json_error("Informe pasta base e nome.")
     try:
-        data = svc.create_file(parent, name)
+        data = drive_svc.create_file(parent, name) if _is_drive(parent) else svc.create_file(parent, name)
         return _json_success({"data": data}, HTTPStatus.CREATED)
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -367,9 +305,9 @@ def upload() -> Response:
     if not files:
         return _json_error("Nenhum arquivo enviado.")
     try:
-        data = svc.save_upload(target, files)
+        data = drive_svc.save_upload(target, files) if _is_drive(target) else svc.save_upload(target, files)
         return _json_success({"data": data}, HTTPStatus.CREATED)
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -381,9 +319,14 @@ def move_items() -> Response:
     if not paths or not destination:
         return _json_error("Informe os itens e a pasta de destino.")
     try:
-        data = svc.move_items(paths, destination)
+        if _is_drive(destination) or any(_is_drive(p) for p in paths):
+            if not _is_drive(destination) or not all(_is_drive(p) for p in paths):
+                return _json_error("Mover entre local e Google Drive nao e suportado. Use upload/download.")
+            data = drive_svc.move_items(paths, destination)
+        else:
+            data = svc.move_items(paths, destination)
         return _json_success({"data": data})
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -395,9 +338,14 @@ def copy_items() -> Response:
     if not paths or not destination:
         return _json_error("Informe os itens e a pasta de destino.")
     try:
-        data = svc.copy_items(paths, destination)
+        if _is_drive(destination) or any(_is_drive(p) for p in paths):
+            if not _is_drive(destination) or not all(_is_drive(p) for p in paths):
+                return _json_error("Copiar entre local e Google Drive nao e suportado. Use upload/download.")
+            data = drive_svc.copy_items(paths, destination)
+        else:
+            data = svc.copy_items(paths, destination)
         return _json_success({"data": data})
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -407,14 +355,9 @@ def export() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
-        filename, csv_bytes = svc.export_directory_snapshot(path)
-        return send_file(
-            io.BytesIO(csv_bytes),
-            mimetype="text/csv",
-            as_attachment=True,
-            download_name=filename,
-        )
-    except svc.DocumentServiceError as exc:
+        filename, csv_bytes = drive_svc.export_directory_snapshot(path) if _is_drive(path) else svc.export_directory_snapshot(path)
+        return send_file(io.BytesIO(csv_bytes), mimetype="text/csv", as_attachment=True, download_name=filename)
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -425,14 +368,12 @@ def open_file() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
-        if drive_svc.is_drive_path(path):
+        if _is_drive(path):
             data = drive_svc.get_details(path)
             return _json_success({"data": {"url": data.get("web_url")}})
         svc.open_with_system(path)
         return _json_success()
-    except drive_svc.GoogleDriveError as exc:
-        return _json_error(str(exc))
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -443,14 +384,12 @@ def open_folder() -> Response:
     if not path:
         return _json_error("Informe o caminho.")
     try:
-        if drive_svc.is_drive_path(path):
+        if _is_drive(path):
             data = drive_svc.get_details(path)
             return _json_success({"data": {"url": data.get("web_url")}})
         svc.open_in_explorer(path)
         return _json_success()
-    except drive_svc.GoogleDriveError as exc:
-        return _json_error(str(exc))
-    except svc.DocumentServiceError as exc:
+    except (drive_svc.GoogleDriveError, svc.DocumentServiceError) as exc:
         return _json_error(str(exc))
 
 
@@ -459,8 +398,7 @@ def get_presets() -> Response:
     user = _current_user_dict()
     if not user:
         return _json_unauthorised()
-    presets = svc.list_presets(user['username'])
-    return _json_success({"data": presets})
+    return _json_success({"data": svc.list_presets(user['username'])})
 
 
 @api_bp.post("/presets")
@@ -497,8 +435,7 @@ def get_favorites() -> Response:
     user = _current_user_dict()
     if not user:
         return _json_unauthorised()
-    favorites = svc.list_favorites(user['username'])
-    return _json_success({"data": favorites})
+    return _json_success({"data": svc.list_favorites(user['username'])})
 
 
 @api_bp.post("/favorites/add")
@@ -536,8 +473,7 @@ def delete_favorite() -> Response:
 
 @api_bp.get("/settings/warning_days")
 def get_warning_days() -> Response:
-    value = svc.get_warning_days()
-    return _json_success({"data": {"warning_days": value}})
+    return _json_success({"data": {"warning_days": svc.get_warning_days()}})
 
 
 @api_bp.post("/settings/warning_days")
@@ -547,8 +483,7 @@ def set_warning_days() -> Response:
     if value is None:
         return _json_error("Informe o valor de dias de aviso.")
     try:
-        numeric = int(value)
-        updated = svc.update_warning_days(numeric)
+        updated = svc.update_warning_days(int(value))
         return _json_success({"data": {"warning_days": updated}})
     except (ValueError, TypeError):
         return _json_error("Valor inválido.")

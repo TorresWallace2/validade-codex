@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --sidebar-width: 360px;
 }
 
@@ -50,16 +50,42 @@ body {
   background-color: rgba(0, 0, 0, 0.45);
 }
 
-.toast-container {
+/* Toasts/alertas globais: fixos dentro da janela, sem ficar cortados na lateral. */
+.app-toast-container {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  left: auto;
+  z-index: 2147483647;
   display: flex;
   flex-direction: column;
+  align-items: flex-end;
   gap: 0.5rem;
+  width: min(420px, calc(100vw - 2rem));
   max-width: calc(100vw - 2rem);
+  pointer-events: none;
 }
 
-#toast-container .toast {
-  max-width: calc(100vw - 2rem);
+.app-toast-container .toast {
+  width: 100%;
+  max-width: 100%;
+  pointer-events: auto;
+  margin: 0;
+}
+
+.app-toast-container .toast-body {
   overflow-wrap: anywhere;
+}
+
+@media (max-width: 576px) {
+  .app-toast-container {
+    top: 0.75rem;
+    right: 0.75rem;
+    left: 0.75rem;
+    width: auto;
+    max-width: none;
+    align-items: stretch;
+  }
 }
 
 .badge-status {

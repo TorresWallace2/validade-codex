@@ -1462,6 +1462,10 @@ async function triggerSimpleAction(endpoint) {
 }
 
 async function quickValidity(type) {
+  if (isGoogleDrivePath()) {
+    showToast('Validade em arquivos do Google Drive ainda nao esta habilitada.', 'info');
+    return;
+  }
   const paths = getValidityTargetPaths();
   if (paths.length === 0) {
     showToast('Selecione ao menos um item para atualizar a validade.', 'warning');
@@ -1516,6 +1520,10 @@ async function quickValidity(type) {
 }
 
 async function submitValidity() {
+  if (isGoogleDrivePath()) {
+    showToast('Validade em arquivos do Google Drive ainda nao esta habilitada.', 'info');
+    return;
+  }
   if (!state.selectedPath) {
     return;
   }
@@ -2058,16 +2066,35 @@ function showToast(message, variant = 'primary') {
   if (!container) {
     return;
   }
+
+  const allowedVariants = new Set(['primary', 'secondary', 'success', 'danger', 'warning', 'info', 'light', 'dark']);
+  const safeVariant = allowedVariants.has(variant) ? variant : 'primary';
+
   const toastElement = document.createElement('div');
-  toastElement.className = `toast align-items-center text-bg-${variant}`;
-  toastElement.role = 'status';
-  toastElement.innerHTML = `
-    <div class="d-flex">
-      <div class="toast-body">${message}</div>
-      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
-    </div>`;
+  toastElement.className = `toast align-items-center text-bg-${safeVariant} border-0`;
+  toastElement.role = 'alert';
+  toastElement.setAttribute('aria-live', 'assertive');
+  toastElement.setAttribute('aria-atomic', 'true');
+
+  const row = document.createElement('div');
+  row.className = 'd-flex';
+
+  const body = document.createElement('div');
+  body.className = 'toast-body';
+  body.textContent = message;
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn-close btn-close-white me-2 m-auto';
+  button.setAttribute('data-bs-dismiss', 'toast');
+  button.setAttribute('aria-label', 'Fechar');
+
+  row.appendChild(body);
+  row.appendChild(button);
+  toastElement.appendChild(row);
   container.appendChild(toastElement);
-  const toast = new bootstrap.Toast(toastElement, { delay: 4000 });
+
+  const toast = new bootstrap.Toast(toastElement, { delay: 5000 });
   toast.show();
   toastElement.addEventListener('hidden.bs.toast', () => {
     toast.dispose();

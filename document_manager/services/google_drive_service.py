@@ -60,6 +60,12 @@ def authorization_url() -> str:
         prompt="consent",
     )
     session["google_oauth_state"] = state
+    # Algumas versões do Google OAuth usam PKCE automaticamente.
+    # Como o callback cria um novo Flow, precisamos guardar o code_verifier
+    # gerado no primeiro passo para trocar o code pelo token depois.
+    code_verifier = getattr(flow, "code_verifier", None)
+    if code_verifier:
+        session["google_oauth_code_verifier"] = code_verifier
     return auth_url
 
 
@@ -68,10 +74,14 @@ def finish_authorization(authorization_response: str, state: str | None) -> None
     if not expected_state or state != expected_state:
         raise GoogleDriveError("Sessao OAuth invalida. Tente conectar novamente.")
     flow = create_flow()
+    code_verifier = session.get("google_oauth_code_verifier")
+    if code_verifier:
+        flow.code_verifier = code_verifier
     flow.fetch_token(authorization_response=authorization_response)
     credentials = flow.credentials
     session["google_drive_credentials"] = credentials_to_dict(credentials)
     session.pop("google_oauth_state", None)
+    session.pop("google_oauth_code_verifier", None)
 
 
 def credentials_to_dict(credentials: Credentials) -> dict[str, Any]:

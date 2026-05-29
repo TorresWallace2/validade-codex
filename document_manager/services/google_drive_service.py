@@ -34,6 +34,7 @@ from ..status import (
 from . import drive_metadata_service as metadata_svc
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+REQUIRED_WRITE_SCOPE = "https://www.googleapis.com/auth/drive"
 DRIVE_PREFIX = "gdrive://"
 ROOT_PATH = "gdrive://root"
 DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -107,6 +108,10 @@ def finish_authorization(authorization_response: str, state: str | None) -> None
     if code_verifier:
         flow.code_verifier = code_verifier
 
+    # Google can return already-granted scopes together with the requested scope
+    # (for example: drive + drive.readonly). oauthlib treats that as a Warning
+    # exception unless this relaxation is enabled, which breaks the callback.
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
     flow.fetch_token(authorization_response=authorization_response)
     credentials = flow.credentials
     session["google_drive_credentials"] = credentials_to_dict(credentials)
@@ -130,6 +135,16 @@ def credentials_from_session() -> Credentials | None:
     data = session.get("google_drive_credentials")
     if not data:
         return None
+
+    scopes = data.get("scopes") or []
+    if REQUIRED_WRITE_SCOPE not in scopes:
+        session.pop("google_drive_credentials", None)
+        _clear_drive_session_caches()
+        raise GoogleDriveError(
+            "Permissoes do Google Drive desatualizadas. "
+            "Desconecte e conecte novamente sua conta Google aceitando as permissoes solicitadas."
+        )
+
     return Credentials(**data)
 
 

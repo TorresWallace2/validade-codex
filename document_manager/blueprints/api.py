@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import io
+import json
+import os
+import time
 from http import HTTPStatus
 from typing import Any
 
 from flask import (
     Blueprint,
     Response,
+    current_app,
     g,
     jsonify,
     make_response,
@@ -190,6 +194,7 @@ def update_user_password(username: str) -> Response:
 
 @api_bp.get("/list_items")
 def list_items() -> Response:
+    started_at = time.perf_counter()
     path = request.args.get("path")
     sort_by = request.args.get("sort_by", "name")
     sort_direction = request.args.get("direction", "asc")
@@ -208,6 +213,22 @@ def list_items() -> Response:
                 search=search,
                 status_filter=status_filter,
             )
+            perf_enabled = str(os.environ.get("APP_DEBUG_PERF", "")).strip().lower() in {"1", "true", "yes", "on"}
+            if perf_enabled:
+                perf_payload = dict(data.get("perf") or {})
+                perf_payload["api_handler_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+                serialize_probe_started = time.perf_counter()
+                json.dumps({"success": True, "data": data}, default=str, ensure_ascii=False)
+                perf_payload["response_serialize_probe_ms"] = round(
+                    (time.perf_counter() - serialize_probe_started) * 1000, 2
+                )
+                data["perf"] = perf_payload
+                current_app.logger.info(
+                    "api.list_items drive request_id=%s total_ms=%.2f response_serialize_probe_ms=%.2f",
+                    perf_payload.get("request_id"),
+                    perf_payload.get("api_handler_ms", 0.0),
+                    perf_payload.get("response_serialize_probe_ms", 0.0),
+                )
             return _json_success({"data": data})
         data = svc.list_directory_items(
             path if path else None,

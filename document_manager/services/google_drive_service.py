@@ -3,21 +3,25 @@
 Performance notes:
 - list_items() is intentionally read-only for metadata. It no longer writes/touches
   one row per file while browsing a Drive folder.
-- Drive listing responses, folder parents and breadcrumbs are cached in Flask's
-  session for a short period to avoid repeated Google Drive API calls while the
-  user navigates back and forth.
+- Drive listing responses, folder parents and breadcrumbs are cached in-memory
+  on each worker for a short period to avoid repeated Google Drive API calls
+  while navigating.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import csv
+import hashlib
 import io
+import json
 import os
 import re
 import time
-import warnings
+from threading import RLock
 from datetime import date, datetime
 from typing import Any, Sequence, Optional
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+from uuid import uuid4
 
 from flask import current_app, session
 from google.oauth2.credentials import Credentials
@@ -35,7 +39,6 @@ from ..status import (
 from . import drive_metadata_service as metadata_svc
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-OPTIONAL_GRANTED_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 DRIVE_PREFIX = "gdrive://"
 ROOT_PATH = "gdrive://root"
 DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -44,11 +47,16 @@ DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 # back/forward, without keeping Drive data stale for too long.
 LIST_CACHE_TTL_SECONDS = int(os.environ.get("GOOGLE_DRIVE_LIST_CACHE_TTL", "60"))
 FOLDER_META_CACHE_TTL_SECONDS = int(os.environ.get("GOOGLE_DRIVE_FOLDER_META_CACHE_TTL", "300"))
+PAGE_TOKENS_CACHE_TTL_SECONDS = int(os.environ.get("GOOGLE_DRIVE_PAGE_TOKENS_TTL", "300"))
+SERVER_CACHE_MAX_ENTRIES = int(os.environ.get("GOOGLE_DRIVE_SERVER_CACHE_MAX_ENTRIES", "512"))
 
 VALIDITY_IN_FILENAME_RE = re.compile(
     r"\bVAL(?:IDADE)?\.?\s*([0-3]?\d[\/\-.][0-1]?\d[\/\-.]\d{4})\b",
     re.IGNORECASE,
 )
+
+_SERVER_CACHE_LOCK = RLock()
+_SERVER_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 
 
 class GoogleDriveError(Exception):
@@ -104,22 +112,33 @@ def finish_authorization(authorization_response: str, state: str | None) -> None
     if not expected_state or state != expected_state:
         raise GoogleDriveError("Sessao OAuth invalida. Tente conectar novamente.")
 
+    callback_query = parse_qs(urlsplit(authorization_response).query)
+    callback_error = (callback_query.get("error") or [None])[0]
+    if callback_error:
+        callback_description = (callback_query.get("error_description") or [""])[0]
+        safe_description = callback_description.replace("+", " ").strip()
+        details = f"{callback_error}: {safe_description}" if safe_description else callback_error
+        raise GoogleDriveError(f"Autorizacao Google recusada ou invalida ({details}).")
+
     flow = create_flow()
     code_verifier = session.get("google_oauth_code_verifier")
     if code_verifier:
         flow.code_verifier = code_verifier
 
-    # Google can return previously granted scopes together with the requested Drive
-    # scope when include_granted_scopes=True. requests-oauthlib raises a Warning
-    # as an exception in that case (for example: drive -> drive drive.readonly).
-    # Accept this additive scope response and continue using the returned token.
+    # Google may return extra scopes already granted by the user. oauthlib raises
+    # a Warning in this case and interrupts token parsing unless relaxed.
+    old_relax_scope = os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE")
+    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
     try:
         flow.fetch_token(authorization_response=authorization_response)
-    except Warning as exc:
-        message = str(exc)
-        if "Scope has changed" not in message:
-            raise
-        warnings.warn(message, stacklevel=2)
+    except Exception as exc:
+        raise GoogleDriveError(f"Falha ao concluir autorizacao do Google Drive: {exc}") from exc
+    finally:
+        if old_relax_scope is None:
+            os.environ.pop("OAUTHLIB_RELAX_TOKEN_SCOPE", None)
+        else:
+            os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = old_relax_scope
+
     credentials = flow.credentials
     if not credentials or not credentials.token:
         raise GoogleDriveError("Falha ao concluir autorizacao do Google Drive. Tente conectar novamente.")
@@ -195,47 +214,87 @@ def _now() -> int:
     return int(time.time())
 
 
+def _perf_enabled() -> bool:
+    return str(os.environ.get("APP_DEBUG_PERF", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cache_owner_key() -> str:
+    user = session.get("user") or {}
+    username = str(user.get("username") or "anonymous").upper()
+    credentials = session.get("google_drive_credentials") or {}
+    token = str(credentials.get("token") or "")
+    token_hash = hashlib.sha1(token.encode("utf-8")).hexdigest()[:12] if token else "no-token"
+    return f"{username}:{token_hash}"
+
+
+def _cache_owner_prefix() -> str:
+    user = session.get("user") or {}
+    username = str(user.get("username") or "anonymous").upper()
+    return f"{username}:"
+
+
+def _server_cache_key(namespace: str, key: str) -> str:
+    return f"{namespace}:{_cache_owner_key()}:{key}"
+
+
+def _server_cache_get(namespace: str, key: str, ttl_seconds: int) -> Any | None:
+    full_key = _server_cache_key(namespace, key)
+    with _SERVER_CACHE_LOCK:
+        entry = _SERVER_CACHE.get(full_key)
+        if not entry:
+            return None
+        if _now() - int(entry.get("ts", 0)) > ttl_seconds:
+            _SERVER_CACHE.pop(full_key, None)
+            return None
+        _SERVER_CACHE.move_to_end(full_key)
+        return entry.get("value")
+
+
+def _server_cache_set(namespace: str, key: str, value: Any) -> None:
+    full_key = _server_cache_key(namespace, key)
+    with _SERVER_CACHE_LOCK:
+        _SERVER_CACHE[full_key] = {"ts": _now(), "value": value}
+        _SERVER_CACHE.move_to_end(full_key)
+        while len(_SERVER_CACHE) > SERVER_CACHE_MAX_ENTRIES:
+            _SERVER_CACHE.popitem(last=False)
+
+
+def _server_cache_clear_namespace(namespace: str) -> None:
+    prefix = f"{namespace}:{_cache_owner_prefix()}"
+    with _SERVER_CACHE_LOCK:
+        for key in [item_key for item_key in _SERVER_CACHE.keys() if item_key.startswith(prefix)]:
+            _SERVER_CACHE.pop(key, None)
+
+
+def _estimate_session_size_bytes() -> int:
+    try:
+        serialized = json.dumps(dict(session), default=str, ensure_ascii=False)
+    except Exception:
+        serialized = str(dict(session))
+    return len(serialized.encode("utf-8"))
+
+
 def _session_cache_get(namespace: str, key: str, ttl_seconds: int) -> Any | None:
-    cache = session.get(namespace) or {}
-    entry = cache.get(key)
-    if not entry:
-        return None
-    if _now() - int(entry.get("ts", 0)) > ttl_seconds:
-        cache.pop(key, None)
-        session[namespace] = cache
-        return None
-    return entry.get("value")
+    return _server_cache_get(namespace, key, ttl_seconds)
 
 
 def _session_cache_set(namespace: str, key: str, value: Any) -> None:
-    cache = session.get(namespace) or {}
-    cache[key] = {"ts": _now(), "value": value}
-
-    # Flask cookie sessions have a size limit. Keep only the most recent entries.
-    if len(cache) > 30:
-        sorted_items = sorted(cache.items(), key=lambda item: item[1].get("ts", 0), reverse=True)
-        cache = dict(sorted_items[:30])
-
-    session[namespace] = cache
+    _server_cache_set(namespace, key, value)
 
 
 def _clear_drive_session_caches() -> None:
-    for key in (
+    for namespace in (
         "google_drive_list_cache",
         "google_drive_folder_meta_cache",
         "google_drive_breadcrumb_cache",
+        "google_drive_page_tokens",
     ):
-        session.pop(key, None)
-    for key in list(session.keys()):
-        if str(key).startswith("google_drive_page_tokens:"):
-            session.pop(key, None)
+        _server_cache_clear_namespace(namespace)
 
 
 def _invalidate_drive_list_cache() -> None:
-    session.pop("google_drive_list_cache", None)
-    for key in list(session.keys()):
-        if str(key).startswith("google_drive_page_tokens:"):
-            session.pop(key, None)
+    _server_cache_clear_namespace("google_drive_list_cache")
+    _server_cache_clear_namespace("google_drive_page_tokens")
 
 
 def _extract_validity_from_filename(filename: str) -> Optional[date]:
@@ -418,6 +477,14 @@ def _breadcrumbs_for(file_id: str) -> list[dict[str, str]]:
     return breadcrumbs
 
 
+def _display_path_from_breadcrumbs(breadcrumbs: Sequence[dict[str, str]] | None) -> str:
+    if not breadcrumbs:
+        return "Google Drive"
+    labels = [str(crumb.get("label") or "").strip() for crumb in breadcrumbs]
+    cleaned = [label for label in labels if label]
+    return " / ".join(cleaned) if cleaned else "Google Drive"
+
+
 def _metadata_for_list_items(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Read metadata only; never write during folder browsing.
 
@@ -494,6 +561,8 @@ def list_items(
     search: str | None = None,
     status_filter: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    request_id = uuid4().hex[:10]
     file_id = path_to_id(path or ROOT_PATH)
     safe_page_size = min(max(int(page_size or 50), 1), 200)
     safe_page = max(int(page or 1), 1)
@@ -501,9 +570,38 @@ def list_items(
     status_allowed = _resolve_status_filter(status_filter)
     status_key = ",".join(sorted(status_allowed))
     cache_key = f"{file_id}:{search_text}:{status_key}:{safe_page}:{safe_page_size}"
+    timings: dict[str, float] = {}
+    cache_hit = False
 
     cached = _session_cache_get("google_drive_list_cache", cache_key, LIST_CACHE_TTL_SECONDS)
     if cached:
+        cache_hit = True
+        if _perf_enabled():
+            perf_payload = dict(cached.get("perf") or {})
+            perf_payload.update(
+                {
+                    "request_id": request_id,
+                    "cache_hit": True,
+                    "total_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "session_size_bytes_est": _estimate_session_size_bytes(),
+                }
+            )
+            current_app.logger.info(
+                "gdrive.list_items request_id=%s path=%s page=%s page_size=%s cache_hit=true total_ms=%.2f session_size_bytes_est=%s",
+                request_id,
+                file_id,
+                safe_page,
+                safe_page_size,
+                perf_payload.get("total_ms", 0.0),
+                perf_payload.get("session_size_bytes_est", 0),
+            )
+            payload = dict(cached)
+            payload["perf"] = perf_payload
+            return payload
+        if "perf" in cached:
+            payload = dict(cached)
+            payload.pop("perf", None)
+            return payload
         return cached
 
     drive = service()
@@ -514,6 +612,7 @@ def list_items(
     query = " and ".join(query_parts)
 
     try:
+        list_started = time.perf_counter()
         if status_allowed:
             # Status is stored in the app metadata, not in Google Drive itself.
             # Therefore we must fetch all files from the folder, apply the status
@@ -535,8 +634,12 @@ def list_items(
                 if not next_token:
                     break
         else:
-            token_key = f"google_drive_page_tokens:{file_id}:{search_text}:{safe_page_size}"
-            tokens = session.get(token_key, {})
+            token_key = f"{file_id}:{search_text}:{safe_page_size}"
+            tokens = _session_cache_get(
+                "google_drive_page_tokens",
+                token_key,
+                PAGE_TOKENS_CACHE_TTL_SECONDS,
+            ) or {}
             page_token = tokens.get(str(safe_page)) if safe_page > 1 else None
             response = drive.files().list(
                 q=query,
@@ -550,13 +653,18 @@ def list_items(
             next_token = response.get("nextPageToken")
             if next_token:
                 tokens[str(safe_page + 1)] = next_token
-                session[token_key] = tokens
+                _session_cache_set("google_drive_page_tokens", token_key, tokens)
             raw_items = response.get("files", [])
+        timings["drive_list_ms"] = round((time.perf_counter() - list_started) * 1000, 2)
     except HttpError as exc:
         raise GoogleDriveError(f"Erro ao listar Google Drive: {exc}") from exc
 
+    metadata_started = time.perf_counter()
     metadata_map = _metadata_for_list_items(raw_items)
     items = [_item_to_dict(item, metadata_map.get(item["id"])) for item in raw_items]
+    timings["metadata_ms"] = round((time.perf_counter() - metadata_started) * 1000, 2)
+
+    filter_started = time.perf_counter()
     if status_allowed:
         items = [item for item in items if item.get("status", {}).get("code") in status_allowed]
         total_items = len(items)
@@ -568,19 +676,49 @@ def list_items(
         total_items = len(items)
         page_items = items
         has_more = bool(next_token)
+    timings["filter_paginate_ms"] = round((time.perf_counter() - filter_started) * 1000, 2)
+
+    breadcrumbs_started = time.perf_counter()
+    parent_path = _parent_path_for(file_id, raw_items)
+    breadcrumbs = _breadcrumbs_for(file_id)
+    current_path_display = _display_path_from_breadcrumbs(breadcrumbs)
+    timings["breadcrumbs_ms"] = round((time.perf_counter() - breadcrumbs_started) * 1000, 2)
 
     result = {
         "items": page_items,
         "current_path": id_to_path(file_id),
-        "parent_path": _parent_path_for(file_id, raw_items),
+        "current_path_display": current_path_display,
+        "parent_path": parent_path,
         "total": total_items,
         "page": safe_page,
         "page_size": safe_page_size,
         "has_more": has_more,
-        "breadcrumbs": _breadcrumbs_for(file_id),
+        "breadcrumbs": breadcrumbs,
         "source": "google_drive",
     }
-    _session_cache_set("google_drive_list_cache", cache_key, result)
+    total_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    timings["total_ms"] = total_ms
+    timings["session_size_bytes_est"] = _estimate_session_size_bytes()
+    timings["request_id"] = request_id
+    timings["cache_hit"] = cache_hit
+    current_app.logger.info(
+        "gdrive.list_items request_id=%s path=%s page=%s page_size=%s cache_hit=%s total_ms=%.2f drive_list_ms=%.2f metadata_ms=%.2f breadcrumbs_ms=%.2f session_size_bytes_est=%s",
+        request_id,
+        file_id,
+        safe_page,
+        safe_page_size,
+        cache_hit,
+        timings.get("total_ms", 0.0),
+        timings.get("drive_list_ms", 0.0),
+        timings.get("metadata_ms", 0.0),
+        timings.get("breadcrumbs_ms", 0.0),
+        timings.get("session_size_bytes_est", 0),
+    )
+    cache_result = dict(result)
+    cache_result.pop("perf", None)
+    _session_cache_set("google_drive_list_cache", cache_key, cache_result)
+    if _perf_enabled():
+        result["perf"] = timings
     return result
 
 def get_details(path: str) -> dict[str, Any]:
@@ -598,12 +736,19 @@ def get_details(path: str) -> dict[str, Any]:
     metadata_map = _apply_metadata_to_items([item])
     meta = metadata_map.get(file_id, {})
     data = _item_to_dict(item, meta)
+    parents = item.get("parents") or []
+    if file_id == "root":
+        detail_breadcrumbs = [{"label": "Google Drive", "path": ROOT_PATH}]
+    else:
+        detail_breadcrumbs = _breadcrumbs_for(parents[0]) if parents else [{"label": "Google Drive", "path": ROOT_PATH}]
+        detail_breadcrumbs = [*detail_breadcrumbs, {"label": item.get("name", "Sem nome"), "path": id_to_path(file_id)}]
     data.update(
         {
             "warning_days": _default_warning_days(meta),
             "notes": meta.get("notes", ""),
             "web_url": item.get("webViewLink"),
             "download_url": item.get("webContentLink"),
+            "path_display": _display_path_from_breadcrumbs(detail_breadcrumbs),
         }
     )
 

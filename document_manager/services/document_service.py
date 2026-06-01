@@ -389,6 +389,7 @@ def list_directory_items(
         "has_more": end < total_items,
         "breadcrumbs": breadcrumbs,
         "current_path": str(base_path),
+        "current_path_display": str(base_path),
         "parent_path": parent,
     }
 
@@ -438,6 +439,7 @@ def get_details(path_str: str) -> dict[str, object]:
     return {
         "name": path.name or str(path),
         "path": str(path),
+        "path_display": str(path),
         "size": human_readable_size(size),
         "modified": modified.strftime("%d/%m/%Y %H:%M"),
         "validity_type": metadata.validity_type,

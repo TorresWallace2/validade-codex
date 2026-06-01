@@ -9,6 +9,7 @@ window.fetch = async (...args) => {
 
 const state = {
   currentPath: '',
+  currentPathDisplay: '',
   sortBy: 'name',
   direction: 'asc',
   page: 1,
@@ -36,6 +37,7 @@ const state = {
   userList: [],
   googleDriveConnected: false,
   googleDriveRootPath: 'gdrive://root',
+  drivePathDisplayCache: new Map(),
 };
 
 const elements = {};
@@ -165,7 +167,7 @@ function setupModals() {
   if (pregaoModalEl) {
     pregaoModalEl.addEventListener('show.bs.modal', () => {
       if (elements.pregaoName) elements.pregaoName.value = '';
-      if (elements.pregaoPath) elements.pregaoPath.value = state.currentPath || '';
+      if (elements.pregaoPath) elements.pregaoPath.value = state.currentPathDisplay || state.currentPath || '';
     });
   }
 
@@ -173,7 +175,7 @@ function setupModals() {
   if (favoriteModalEl) {
     favoriteModalEl.addEventListener('show.bs.modal', () => {
       if (elements.favoriteName) elements.favoriteName.value = '';
-      if (elements.favoritePath) elements.favoritePath.value = state.currentPath || '';
+      if (elements.favoritePath) elements.favoritePath.value = state.currentPathDisplay || state.currentPath || '';
     });
   }
 
@@ -406,6 +408,7 @@ function restorePreferences() {
   const params = new URLSearchParams(window.location.search);
   if (params.get('drive') === 'connected') {
     state.currentPath = state.googleDriveRootPath;
+    state.currentPathDisplay = displayPath(state.currentPath, 'Google Drive');
     localStorage.setItem('docmgr-last-path', state.currentPath);
     window.history.replaceState({}, document.title, window.location.pathname);
     return;
@@ -414,6 +417,7 @@ function restorePreferences() {
   if (lastPath) {
     state.currentPath = lastPath;
   }
+  state.currentPathDisplay = displayPath(state.currentPath, state.currentPath);
 }
 
 function handleThemeToggle(event) {
@@ -428,8 +432,11 @@ function startAutoRefresh() {
     clearInterval(state.autoRefreshTimer);
   }
   state.autoRefreshTimer = setInterval(() => {
+    if (document.hidden || state.isLoading) {
+      return;
+    }
     reloadDirectory(true, { silent: true, preserveSelection: true });
-  }, 60000);
+  }, 120000);
 }
 
 function setLoading(isLoading) {
@@ -468,6 +475,67 @@ function isGoogleDrivePath(path = state.currentPath) {
   return Boolean(path && path.startsWith('gdrive://'));
 }
 
+function cacheDriveDisplayPath(path, label) {
+  if (!path || !isGoogleDrivePath(path) || !label) {
+    return;
+  }
+  state.drivePathDisplayCache.set(path, label);
+}
+
+function cacheDriveBreadcrumbDisplay(breadcrumbs) {
+  if (!Array.isArray(breadcrumbs) || breadcrumbs.length === 0) {
+    return;
+  }
+  const parts = [];
+  breadcrumbs.forEach((crumb) => {
+    const label = (crumb && (crumb.label || crumb.path)) ? String(crumb.label || crumb.path).trim() : '';
+    if (!label) {
+      return;
+    }
+    parts.push(label);
+    const crumbPath = crumb && crumb.path ? String(crumb.path) : '';
+    if (crumbPath) {
+      cacheDriveDisplayPath(crumbPath, parts.join(' / '));
+    }
+  });
+}
+
+function displayPath(path, fallback = '') {
+  if (!path) {
+    return fallback || '';
+  }
+  if (!isGoogleDrivePath(path)) {
+    return path;
+  }
+  const cached = state.drivePathDisplayCache.get(path);
+  if (cached) {
+    return cached;
+  }
+  if (path === state.googleDriveRootPath || path === 'gdrive://root') {
+    return 'Google Drive';
+  }
+  return fallback || path;
+}
+
+function resolveDriveDisplayToPath(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) {
+    return null;
+  }
+  if (value.startsWith('gdrive://')) {
+    return value;
+  }
+  if (value === 'Google Drive') {
+    return state.googleDriveRootPath;
+  }
+  for (const [path, label] of state.drivePathDisplayCache.entries()) {
+    if (label === value) {
+      return path;
+    }
+  }
+  return null;
+}
+
 async function fetchGoogleDriveStatus() {
   try {
     const response = await fetch('/api/google-drive/status');
@@ -475,6 +543,7 @@ async function fetchGoogleDriveStatus() {
     if (payload.success && payload.data) {
       state.googleDriveConnected = Boolean(payload.data.connected);
       state.googleDriveRootPath = payload.data.root_path || 'gdrive://root';
+      cacheDriveDisplayPath(state.googleDriveRootPath, 'Google Drive');
     }
   } catch (error) {
     console.error(error);
@@ -498,8 +567,9 @@ function handleGoogleDriveButton() {
     return;
   }
   state.currentPath = state.googleDriveRootPath;
+  state.currentPathDisplay = displayPath(state.currentPath, 'Google Drive');
   if (elements.addressInput) {
-    elements.addressInput.value = state.currentPath;
+    elements.addressInput.value = state.currentPathDisplay || state.currentPath;
   }
   reloadDirectory(true);
 }
@@ -758,9 +828,13 @@ async function loadDirectory(reset = false, options = {}) {
     }
 
     const { data } = payload;
+    if (data && data.perf) {
+      console.debug('list_items perf', data.perf);
+    }
     const {
       items,
       current_path: currentPath,
+      current_path_display: currentPathDisplay,
       parent_path: parentPath,
       total,
       has_more: hasMore,
@@ -769,9 +843,11 @@ async function loadDirectory(reset = false, options = {}) {
     if (!state.currentPath || reset) {
       state.currentPath = currentPath;
     }
+    state.currentPathDisplay = currentPathDisplay || displayPath(state.currentPath, state.currentPath);
     state.parentPath = parentPath;
+    cacheDriveBreadcrumbDisplay(data.breadcrumbs);
     if (elements.addressInput) {
-      elements.addressInput.value = state.currentPath;
+      elements.addressInput.value = state.currentPathDisplay || state.currentPath;
     }
     localStorage.setItem('docmgr-last-path', state.currentPath);
 
@@ -790,7 +866,7 @@ async function loadDirectory(reset = false, options = {}) {
     }
 
     attachSentinel();
-    updateSummary(total, currentPath);
+    updateSummary(total, state.currentPathDisplay || currentPath);
 
     if (reset && items.length > 0) {
       const targetPath = options.preserveSelection && state.selectedPath ? state.selectedPath : items[0].path;
@@ -1207,11 +1283,16 @@ function selectRow(row) {
   if (!row) {
     return;
   }
+  const nextPath = row.dataset.path;
+  const nextType = row.dataset.type;
+  const sameSelection = state.selectedPath === nextPath && state.selectedType === nextType;
   elements.tableBody.querySelectorAll('tr').forEach((tr) => tr.classList.remove('active'));
   row.classList.add('active');
-  state.selectedPath = row.dataset.path;
-  state.selectedType = row.dataset.type;
-  loadDetails();
+  if (!sameSelection || !state.detail || state.detail.path !== nextPath) {
+    state.selectedPath = nextPath;
+    state.selectedType = nextType;
+    loadDetails();
+  }
   updateActionButtons();
 }
 
@@ -1300,7 +1381,7 @@ async function loadDetails() {
 
 function fillDetails(detail) {
   elements.detailName.textContent = detail.name;
-  elements.detailPath.textContent = detail.path;
+  elements.detailPath.textContent = detail.path_display || displayPath(detail.path, detail.path);
   elements.detailSize.textContent = `Tamanho: ${detail.size}`;
   elements.detailModified.textContent = `Modificado: ${detail.modified}`;
   let validityText = detail.validity;
@@ -1506,9 +1587,6 @@ async function quickValidity(type) {
     }
 
     await reloadDirectory(true, { preserveSelection: true });
-    if (state.selectedPath) {
-      await loadDetails();
-    }
   } catch (error) {
     console.error(error);
     showToast(error.message, 'danger');
@@ -1548,7 +1626,6 @@ async function submitValidity() {
     modals.validity.hide();
     showToast('Validade definida com sucesso.', 'success');
     await reloadDirectory(true, { preserveSelection: true });
-    await loadDetails();
   } catch (error) {
     console.error(error);
     showToast(error.message, 'danger');
@@ -1587,7 +1664,6 @@ async function submitRename() {
     }
     state.selectedPath = payload.data.path;
     await reloadDirectory(true, { preserveSelection: true });
-    await loadDetails();
   } catch (error) {
     console.error(error);
     showToast(error.message, 'danger');
@@ -1789,7 +1865,11 @@ function openPregaoModal() {
 
 async function submitPregao() {
   const name = elements.pregaoName.value.trim();
-  const path = (elements.pregaoPath && elements.pregaoPath.value.trim()) || state.currentPath || '';
+  let path = (elements.pregaoPath && elements.pregaoPath.value.trim()) || state.currentPath || '';
+  const resolvedDrivePath = resolveDriveDisplayToPath(path);
+  if (resolvedDrivePath) {
+    path = resolvedDrivePath;
+  }
   if (!name) {
     showToast('Informe o nome do pregão.', 'warning');
     return;
@@ -1857,16 +1937,17 @@ function renderPregoes(pregoes) {
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'btn btn-link text-start flex-grow-1';
-    link.textContent = pregao.name;
+    link.textContent = `${pregao.name} - ${displayPath(pregao.path, pregao.path)}`;
     if (state.selectedPregao && state.selectedPregao.path === pregao.path) {
       link.classList.add('fw-semibold', 'text-primary');
     }
     link.addEventListener('click', () => {
       state.currentPath = pregao.path;
+      state.currentPathDisplay = displayPath(pregao.path, pregao.path);
       state.selectedPregao = { name: pregao.name, path: pregao.path };
       state.selectedFavorite = null;
       const inp = document.getElementById('addressInput');
-      if (inp) inp.value = pregao.path;
+      if (inp) inp.value = state.currentPathDisplay || pregao.path;
       renderFavorites(state.favorites);
       updatePregaoSelectionButton();
       reloadDirectory(true);
@@ -1915,7 +1996,11 @@ function openFavoriteModal() {
 
 async function submitFavorite() {
   const name = elements.favoriteName.value.trim();
-  const path = (elements.favoritePath && elements.favoritePath.value.trim()) || state.currentPath || '';
+  let path = (elements.favoritePath && elements.favoritePath.value.trim()) || state.currentPath || '';
+  const resolvedDrivePath = resolveDriveDisplayToPath(path);
+  if (resolvedDrivePath) {
+    path = resolvedDrivePath;
+  }
   if (!name) {
     showToast('Informe o nome do favorito.', 'warning');
     return;
@@ -1983,16 +2068,17 @@ function renderFavorites(favorites) {
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'btn btn-link text-start flex-grow-1';
-    link.textContent = favorite.name;
+    link.textContent = `${favorite.name} - ${displayPath(favorite.path, favorite.path)}`;
     if (state.selectedFavorite && state.selectedFavorite.path === favorite.path) {
       link.classList.add('fw-semibold', 'text-primary');
     }
     link.addEventListener('click', () => {
       state.currentPath = favorite.path;
+      state.currentPathDisplay = displayPath(favorite.path, favorite.path);
       state.selectedFavorite = { name: favorite.name, path: favorite.path };
       state.selectedPregao = null;
       const inp = document.getElementById('addressInput');
-      if (inp) inp.value = favorite.path;
+      if (inp) inp.value = state.currentPathDisplay || favorite.path;
       renderPregoes(state.pregoes);
       updateFavoriteSelectionButton();
       reloadDirectory(true);
@@ -2105,8 +2191,9 @@ function navigateUpDirectory() {
     return;
   }
   state.currentPath = parent;
+  state.currentPathDisplay = displayPath(parent, parent);
   if (elements.addressInput) {
-    elements.addressInput.value = parent;
+    elements.addressInput.value = state.currentPathDisplay || parent;
   }
   reloadDirectory(true);
 }
@@ -2120,7 +2207,17 @@ function navigateToAddress() {
     showToast('Informe um caminho para navegar.', 'warning');
     return;
   }
-  state.currentPath = value;
+  let resolvedPath = value;
+  if (isGoogleDrivePath() || value === 'Google Drive' || value.includes(' / ')) {
+    resolvedPath = resolveDriveDisplayToPath(value);
+    if (!resolvedPath) {
+      showToast('Caminho do Google Drive nao reconhecido. Use os breadcrumbs para navegar.', 'warning');
+      input.value = state.currentPathDisplay || displayPath(state.currentPath, state.currentPath);
+      return;
+    }
+  }
+  state.currentPath = resolvedPath;
+  state.currentPathDisplay = displayPath(resolvedPath, resolvedPath);
   state.page = 1;
   try {
     reloadDirectory(true);
@@ -2146,7 +2243,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const obs = new MutationObserver(() => {
       // Keep address bar in sync with current state path
       if (typeof state?.currentPath === 'string') {
-        input.value = state.currentPath || '';
+        input.value = state.currentPathDisplay || displayPath(state.currentPath, state.currentPath);
       }
     });
     obs.observe(breadcrumb, { childList: true, subtree: true });
@@ -2154,20 +2251,3 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 
-// Correção: manter ações principais disponíveis dentro do Google Drive.
-function forceEnableGoogleDriveActions() {
-  try {
-    if (typeof isGoogleDrivePath !== 'function' || !isGoogleDrivePath()) return;
-    [elements.btnUpload, elements.btnNewFolder, elements.btnNewFile, elements.btnExport].forEach((button) => {
-      if (!button) return;
-      button.disabled = false;
-      button.classList.remove('disabled');
-      button.removeAttribute('aria-disabled');
-    });
-  } catch (error) {
-    console.warn('Nao foi possivel atualizar botoes do Google Drive.', error);
-  }
-}
-setInterval(forceEnableGoogleDriveActions, 500);
-document.addEventListener('DOMContentLoaded', forceEnableGoogleDriveActions);
-document.addEventListener('click', () => setTimeout(forceEnableGoogleDriveActions, 0));

@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from datetime import date
+from threading import RLock
+from time import perf_counter
 from typing import Any, Iterator, Sequence
 
 from flask import current_app
@@ -27,6 +29,8 @@ class DriveMetadataError(RuntimeError):
 VALIDITY_TYPES = {"defined", "indeterminate", "not_defined"}
 MANUAL_SOURCES = {"manual", "manual_not_defined", "manual_indeterminate"}
 AUTO_SOURCE = "auto_filename"
+_SCHEMA_READY = False
+_SCHEMA_LOCK = RLock()
 
 
 def _database_url() -> str:
@@ -112,8 +116,21 @@ def init_schema() -> None:
 
 
 def ensure_schema() -> None:
-    # This avoids first-request failures after a fresh deploy/database reset.
-    init_schema()
+    # Avoid repeated DDL on every request.
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY:
+            return
+        started = perf_counter()
+        init_schema()
+        _SCHEMA_READY = True
+        elapsed_ms = round((perf_counter() - started) * 1000, 2)
+        try:
+            current_app.logger.info("drive_metadata.ensure_schema initialized in %.2fms", elapsed_ms)
+        except Exception:
+            pass
 
 
 def _default_warning_days(warning_days: int | None = None) -> int:

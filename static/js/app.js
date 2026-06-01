@@ -1087,6 +1087,18 @@ function updateSelectionIndicators() {
   }
 }
 
+function updateTransferPathInput(technicalPath, displayPathOverride = '') {
+  if (!elements.transferPathInput) {
+    return;
+  }
+  const isDrive = isGoogleDrivePath(technicalPath);
+  const displayValue = isDrive
+    ? (displayPathOverride || displayPath(technicalPath, technicalPath))
+    : (technicalPath || '');
+  elements.transferPathInput.readOnly = isDrive;
+  elements.transferPathInput.value = displayValue;
+}
+
 function openTransferModal(mode) {
   const selected = getSelectedPaths();
   if (selected.length === 0) {
@@ -1109,9 +1121,12 @@ function openTransferModal(mode) {
     elements.btnConfirmTransfer.textContent = mode === 'move' ? 'Mover' : 'Copiar';
     elements.btnConfirmTransfer.disabled = false;
   }
-  if (elements.transferPathInput) {
-    elements.transferPathInput.value = state.transferTargetPath;
-  }
+  updateTransferPathInput(
+    state.transferTargetPath,
+    isGoogleDrivePath(state.transferTargetPath)
+      ? (state.currentPathDisplay || displayPath(state.transferTargetPath, state.transferTargetPath))
+      : state.transferTargetPath,
+  );
 
   updateSelectionIndicators();
   loadTransferDirectory(state.transferTargetPath);
@@ -1119,7 +1134,17 @@ function openTransferModal(mode) {
 }
 
 function navigateTransferPath(path) {
-  const target = (typeof path === 'string' ? path : (elements.transferPathInput ? elements.transferPathInput.value : '')).trim();
+  let target = '';
+  if (typeof path === 'string') {
+    target = path.trim();
+  } else {
+    const inputValue = (elements.transferPathInput ? elements.transferPathInput.value : '').trim();
+    if (isGoogleDrivePath(state.transferTargetPath)) {
+      target = resolveDriveDisplayToPath(inputValue) || state.transferTargetPath || '';
+    } else {
+      target = inputValue;
+    }
+  }
   if (!target) {
     showToast('Informe um destino válido.', 'warning');
     return;
@@ -1164,9 +1189,10 @@ async function loadTransferDirectory(path) {
     const { data } = payload;
     state.transferTargetPath = data.current_path;
     state.transferParentPath = data.parent_path;
-    if (elements.transferPathInput) {
-      elements.transferPathInput.value = state.transferTargetPath;
-    }
+    updateTransferPathInput(
+      state.transferTargetPath,
+      data.current_path_display || displayPath(state.transferTargetPath, state.transferTargetPath),
+    );
     const directories = (data.items || []).filter((item) => item.type === 'directory');
     renderTransferDirectories(directories);
   } catch (error) {
@@ -1203,7 +1229,7 @@ function renderTransferDirectories(directories) {
 }
 
 async function createFolderInTransfer() {
-  const parent = (elements.transferPathInput ? elements.transferPathInput.value : state.transferTargetPath || '').trim();
+  const parent = (state.transferTargetPath || '').trim();
   if (!parent) {
     showToast('Navegue até uma pasta antes de criar uma nova.', 'warning');
     return;
@@ -1239,7 +1265,7 @@ async function submitTransferAction() {
   if (!state.transferMode) {
     return;
   }
-  const destination = (elements.transferPathInput ? elements.transferPathInput.value : '').trim();
+  const destination = (state.transferTargetPath || '').trim();
   const paths = getSelectedPaths();
   if (!destination) {
     showToast('Informe a pasta destino.', 'warning');

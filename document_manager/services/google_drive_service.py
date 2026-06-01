@@ -940,13 +940,28 @@ def rename_item(path: str, new_name: str) -> dict[str, Any]:
     except HttpError as exc:
         raise GoogleDriveError(f"Sem permissao ou falha ao renomear item do Drive: {exc}") from exc
 
-    metadata_svc.touch_file(
-        file_id,
-        file_name=item.get("name", new_name),
-        source_uri=id_to_path(file_id),
-        mime_type=item.get("mimeType", ""),
-        web_url=item.get("webViewLink", ""),
-    )
+    # Keep list validity/status in sync right after rename:
+    # if the new file name contains a validity date (for example "VAL. 31-03-2027"),
+    # persist the inferred metadata immediately.
+    is_folder = item.get("mimeType") == DRIVE_FOLDER_MIME_TYPE
+    inferred = None if is_folder else _extract_validity_from_filename(item.get("name", new_name))
+    if inferred is not None:
+        metadata_svc.apply_auto_validity_from_filename(
+            file_id,
+            item.get("name", new_name),
+            inferred,
+            source_uri=id_to_path(file_id),
+            mime_type=item.get("mimeType", ""),
+            web_url=item.get("webViewLink", ""),
+        )
+    else:
+        metadata_svc.touch_file(
+            file_id,
+            file_name=item.get("name", new_name),
+            source_uri=id_to_path(file_id),
+            mime_type=item.get("mimeType", ""),
+            web_url=item.get("webViewLink", ""),
+        )
     _clear_drive_session_caches()
     return {"path": id_to_path(file_id), "name": item.get("name", new_name)}
 

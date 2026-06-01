@@ -1633,10 +1633,6 @@ async function submitValidity() {
 }
 
 async function submitRename() {
-  if (isGoogleDrivePath()) {
-    showToast('Renomear no Google Drive ainda nao esta habilitado.', 'info');
-    return;
-  }
   if (!state.selectedPath) {
     return;
   }
@@ -1937,7 +1933,7 @@ function renderPregoes(pregoes) {
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'btn btn-link text-start flex-grow-1';
-    link.textContent = `${pregao.name} - ${displayPath(pregao.path, pregao.path)}`;
+    link.textContent = pregao.name;
     if (state.selectedPregao && state.selectedPregao.path === pregao.path) {
       link.classList.add('fw-semibold', 'text-primary');
     }
@@ -2068,7 +2064,7 @@ function renderFavorites(favorites) {
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'btn btn-link text-start flex-grow-1';
-    link.textContent = `${favorite.name} - ${displayPath(favorite.path, favorite.path)}`;
+    link.textContent = favorite.name;
     if (state.selectedFavorite && state.selectedFavorite.path === favorite.path) {
       link.classList.add('fw-semibold', 'text-primary');
     }

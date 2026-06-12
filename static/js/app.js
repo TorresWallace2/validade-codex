@@ -36,7 +36,9 @@ const state = {
   currentUser: null,
   userList: [],
   googleDriveConnected: false,
-  googleDriveRootPath: 'gdrive://root',
+  googleDriveRootPath: '',
+  googleDriveAccounts: [],
+  activeGoogleDriveAccount: null,
   drivePathDisplayCache: new Map(),
 };
 
@@ -65,7 +67,9 @@ function cacheElements() {
   elements.btnNavigateUp = document.getElementById('btnNavigateUp');
   elements.darkModeToggle = document.getElementById('darkModeToggle');
   elements.btnGoogleDrive = document.getElementById('btnGoogleDrive');
-  elements.btnDisconnectGoogleDrive = document.getElementById('btnDisconnectGoogleDrive');
+  elements.activeDriveBadge = document.getElementById('activeDriveBadge');
+  elements.driveAccountsList = document.getElementById('driveAccountsList');
+  elements.btnAddGoogleDriveAccount = document.getElementById('btnAddGoogleDriveAccount');
   elements.searchInput = document.getElementById('searchInput');
   elements.btnClearSearch = document.getElementById('btnClearSearch');
   elements.btnApplyStatus = document.getElementById('btnApplyStatus');
@@ -143,6 +147,7 @@ function setupModals() {
   modals.favorite = new bootstrap.Modal(document.getElementById('favoriteModal'));
   modals.userManager = new bootstrap.Modal(document.getElementById('userManagerModal'));
   modals.transfer = new bootstrap.Modal(document.getElementById('transferModal'));
+  modals.driveAccounts = new bootstrap.Modal(document.getElementById('driveAccountsModal'));
 
   document.getElementById('validityModal').addEventListener('show.bs.modal', () => {
     if (!state.detail) {
@@ -242,8 +247,8 @@ function setupListeners() {
   if (elements.btnGoogleDrive) {
     elements.btnGoogleDrive.addEventListener('click', handleGoogleDriveButton);
   }
-  if (elements.btnDisconnectGoogleDrive) {
-    elements.btnDisconnectGoogleDrive.addEventListener('click', disconnectGoogleDrive);
+  if (elements.btnAddGoogleDriveAccount) {
+    elements.btnAddGoogleDriveAccount.addEventListener('click', connectGoogleDriveAccount);
   }
   if (elements.userCreateForm) {
     elements.userCreateForm.addEventListener('submit', handleUserCreate);
@@ -385,6 +390,7 @@ async function bootstrapApp() {
   await fetchGoogleDriveStatus();
   updateUserBanner();
   updateGoogleDriveButtons();
+  renderDriveAccounts();
   updatePregaoSelectionButton();
   updateFavoriteSelectionButton();
   setupModals();
@@ -407,8 +413,12 @@ function restorePreferences() {
 
   const params = new URLSearchParams(window.location.search);
   if (params.get('drive') === 'connected') {
-    state.currentPath = state.googleDriveRootPath;
-    state.currentPathDisplay = displayPath(state.currentPath, 'Google Drive');
+    const accountId = params.get('account_id');
+    const matchingAccount = accountId
+      ? state.googleDriveAccounts.find((account) => String(account.account_id) === String(accountId))
+      : state.activeGoogleDriveAccount;
+    state.currentPath = matchingAccount ? matchingAccount.root_path : state.googleDriveRootPath;
+    state.currentPathDisplay = displayPath(state.currentPath, state.activeGoogleDriveAccount?.label || 'Google Drive');
     localStorage.setItem('docmgr-last-path', state.currentPath);
     window.history.replaceState({}, document.title, window.location.pathname);
     return;
@@ -511,8 +521,8 @@ function displayPath(path, fallback = '') {
   if (cached) {
     return cached;
   }
-  if (path === state.googleDriveRootPath || path === 'gdrive://root') {
-    return 'Google Drive';
+  if (path === state.googleDriveRootPath) {
+    return state.activeGoogleDriveAccount?.label || 'Google Drive';
   }
   return fallback || path;
 }
@@ -525,8 +535,8 @@ function resolveDriveDisplayToPath(rawValue) {
   if (value.startsWith('gdrive://')) {
     return value;
   }
-  if (value === 'Google Drive') {
-    return state.googleDriveRootPath;
+  if (state.activeGoogleDriveAccount && value === state.activeGoogleDriveAccount.label) {
+    return state.activeGoogleDriveAccount.root_path;
   }
   for (const [path, label] of state.drivePathDisplayCache.entries()) {
     if (label === value) {
@@ -542,8 +552,15 @@ async function fetchGoogleDriveStatus() {
     const payload = await response.json();
     if (payload.success && payload.data) {
       state.googleDriveConnected = Boolean(payload.data.connected);
-      state.googleDriveRootPath = payload.data.root_path || 'gdrive://root';
-      cacheDriveDisplayPath(state.googleDriveRootPath, 'Google Drive');
+      state.googleDriveAccounts = Array.isArray(payload.data.accounts) ? payload.data.accounts : [];
+      state.activeGoogleDriveAccount = payload.data.active_account || null;
+      state.googleDriveRootPath = payload.data.default_root_path || '';
+      state.drivePathDisplayCache.clear();
+      state.googleDriveAccounts.forEach((account) => {
+        if (account && account.root_path && account.label) {
+          cacheDriveDisplayPath(account.root_path, account.label);
+        }
+      });
     }
   } catch (error) {
     console.error(error);
@@ -552,37 +569,172 @@ async function fetchGoogleDriveStatus() {
 
 function updateGoogleDriveButtons() {
   if (elements.btnGoogleDrive) {
-    elements.btnGoogleDrive.innerHTML = state.googleDriveConnected
-      ? '<i class="bi bi-google me-1"></i>Abrir Google Drive'
-      : '<i class="bi bi-google me-1"></i>Conectar Google Drive';
+    const count = state.googleDriveAccounts.length;
+    elements.btnGoogleDrive.innerHTML = `<i class="bi bi-google me-1"></i>Contas Google Drive${count ? ` (${count})` : ''}`;
   }
-  if (elements.btnDisconnectGoogleDrive) {
-    elements.btnDisconnectGoogleDrive.classList.toggle('d-none', !state.googleDriveConnected);
+  if (elements.activeDriveBadge) {
+    const active = state.activeGoogleDriveAccount;
+    elements.activeDriveBadge.classList.toggle('d-none', !active);
+    if (active) {
+      const statusLabel = active.connected ? 'Conectada' : 'Desconectada';
+      elements.activeDriveBadge.textContent = `Drive ativo: ${active.label} - ${statusLabel}`;
+    } else {
+      elements.activeDriveBadge.textContent = '';
+    }
   }
 }
 
 function handleGoogleDriveButton() {
-  if (!state.googleDriveConnected) {
-    window.location.href = '/auth/google/connect';
-    return;
+  renderDriveAccounts();
+  if (modals.driveAccounts) {
+    modals.driveAccounts.show();
   }
-  state.currentPath = state.googleDriveRootPath;
-  state.currentPathDisplay = displayPath(state.currentPath, 'Google Drive');
-  if (elements.addressInput) {
-    elements.addressInput.value = state.currentPathDisplay || state.currentPath;
-  }
-  reloadDirectory(true);
 }
 
-async function disconnectGoogleDrive() {
+async function connectGoogleDriveAccount() {
   try {
-    await fetch('/api/google-drive/disconnect', { method: 'POST' });
+    const response = await fetch('/api/google-drive/accounts/connect', { method: 'POST' });
+    const payload = await response.json();
+    if (!response.ok || !payload.success || !payload.data?.auth_url) {
+      throw new Error(payload.error || 'Nao foi possivel iniciar a conexao com o Google Drive.');
+    }
+    window.location.href = payload.data.auth_url;
   } catch (error) {
     console.error(error);
+    showToast(error.message || 'Nao foi possivel iniciar a conexao com o Google Drive.', 'danger');
   }
-  state.googleDriveConnected = false;
+}
+
+function renderDriveAccounts() {
+  if (!elements.driveAccountsList) {
+    return;
+  }
+  elements.driveAccountsList.innerHTML = '';
+  if (!state.googleDriveAccounts.length) {
+    elements.driveAccountsList.innerHTML = '<div class="list-group-item text-muted">Nenhuma conta conectada.</div>';
+    return;
+  }
+  state.googleDriveAccounts.forEach((account) => {
+    const row = document.createElement('div');
+    row.className = 'list-group-item';
+    const statusBadgeClass = account.connected ? 'text-bg-success' : 'text-bg-secondary';
+    const activeBadge = account.is_active ? '<span class="badge text-bg-primary">Ativa</span>' : '';
+    row.innerHTML = `
+      <div class="d-flex justify-content-between align-items-start gap-3">
+        <div>
+          <div class="fw-semibold">${account.label}</div>
+          <div class="small text-muted">${account.google_email || ''}</div>
+          <div class="mt-2 d-flex gap-2 flex-wrap">
+            <span class="badge ${statusBadgeClass}">${account.connected ? 'Conectada' : 'Desconectada'}</span>
+            ${activeBadge}
+          </div>
+        </div>
+        <div class="d-flex flex-wrap gap-2 justify-content-end">
+          <button type="button" class="btn btn-outline-primary btn-sm" data-action="open">Abrir Drive</button>
+          <button type="button" class="btn btn-outline-secondary btn-sm" data-action="activate">Ativar</button>
+          <button type="button" class="btn btn-outline-danger btn-sm" data-action="disconnect">Desconectar</button>
+          <button type="button" class="btn btn-outline-success btn-sm" data-action="reconnect">Reconectar</button>
+        </div>
+      </div>
+    `;
+    row.querySelectorAll('button[data-action]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const action = button.dataset.action;
+        if (action === 'open') {
+          await openDriveAccount(account.account_id);
+        } else if (action === 'activate') {
+          await activateDriveAccount(account.account_id, { openAfter: false });
+        } else if (action === 'disconnect') {
+          await disconnectDriveAccount(account.account_id);
+        } else if (action === 'reconnect') {
+          await reconnectDriveAccount(account.account_id);
+        }
+      });
+    });
+    elements.driveAccountsList.appendChild(row);
+  });
+}
+
+async function refreshDriveAccountsState() {
+  await fetchGoogleDriveStatus();
   updateGoogleDriveButtons();
-  showToast('Google Drive desconectado.', 'info');
+  renderDriveAccounts();
+  await fetchPregoes();
+  await fetchFavorites();
+}
+
+async function activateDriveAccount(accountId, options = {}) {
+  try {
+    const response = await fetch(`/api/google-drive/accounts/${encodeURIComponent(accountId)}/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error || 'Nao foi possivel ativar a conta Google Drive.');
+    }
+    await refreshDriveAccountsState();
+    if (options.openAfter) {
+      const account = state.googleDriveAccounts.find((item) => String(item.account_id) === String(accountId));
+      if (account) {
+        state.currentPath = account.root_path;
+        state.currentPathDisplay = displayPath(account.root_path, account.label);
+        if (elements.addressInput) {
+          elements.addressInput.value = state.currentPathDisplay || state.currentPath;
+        }
+        await reloadDirectory(true);
+      }
+    } else {
+      showToast('Conta Google Drive ativada.', 'success');
+    }
+  } catch (error) {
+    console.error(error);
+    showToast(error.message || 'Nao foi possivel ativar a conta Google Drive.', 'danger');
+  }
+}
+
+async function openDriveAccount(accountId) {
+  const account = state.googleDriveAccounts.find((item) => String(item.account_id) === String(accountId));
+  if (account && !account.connected) {
+    await reconnectDriveAccount(accountId);
+    return;
+  }
+  await activateDriveAccount(accountId, { openAfter: true });
+}
+
+async function disconnectDriveAccount(accountId) {
+  try {
+    const response = await fetch(`/api/google-drive/accounts/${encodeURIComponent(accountId)}/disconnect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.success) {
+      throw new Error(payload.error || 'Nao foi possivel desconectar a conta Google Drive.');
+    }
+    await refreshDriveAccountsState();
+    showToast('Conta Google Drive desconectada.', 'info');
+  } catch (error) {
+    console.error(error);
+    showToast(error.message || 'Nao foi possivel desconectar a conta Google Drive.', 'danger');
+  }
+}
+
+async function reconnectDriveAccount(accountId) {
+  try {
+    const response = await fetch(`/api/google-drive/accounts/${encodeURIComponent(accountId)}/reconnect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.success || !payload.data?.auth_url) {
+      throw new Error(payload.error || 'Nao foi possivel iniciar a reconexao da conta Google Drive.');
+    }
+    window.location.href = payload.data.auth_url;
+  } catch (error) {
+    console.error(error);
+    showToast(error.message || 'Nao foi possivel iniciar a reconexao da conta Google Drive.', 'danger');
+  }
 }
 
 async function fetchSession() {
@@ -842,6 +994,15 @@ async function loadDirectory(reset = false, options = {}) {
 
     if (!state.currentPath || reset) {
       state.currentPath = currentPath;
+    }
+    if (data.account_id) {
+      const matched = state.googleDriveAccounts.find((account) => String(account.account_id) === String(data.account_id));
+      if (matched) {
+        state.activeGoogleDriveAccount = matched;
+        state.googleDriveRootPath = matched.root_path;
+        cacheDriveDisplayPath(matched.root_path, matched.label);
+        updateGoogleDriveButtons();
+      }
     }
     state.currentPathDisplay = currentPathDisplay || displayPath(state.currentPath, state.currentPath);
     state.parentPath = parentPath;
@@ -1877,6 +2038,38 @@ function openWarningSettings() {
   modals.warningDays.show();
 }
 
+function formatSavedItemLabel(item) {
+  if (!item || item.source !== 'google_drive') {
+    return item?.name || '';
+  }
+  const accountLabel = item.account_label || 'Conta Google Drive';
+  const statusLabel = item.account_status === 'connected' ? 'Conectada' : 'Desconectada';
+  return `${item.name} - ${accountLabel} - ${statusLabel}`;
+}
+
+async function openSavedDriveItem(item) {
+  if (!item || item.source !== 'google_drive') {
+    return false;
+  }
+  if (item.account_status !== 'connected') {
+    showToast(`A conta ${item.account_label || 'Google Drive'} esta desconectada. Reconecte para abrir este item.`, 'warning');
+    return true;
+  }
+  if (!item.account_id) {
+    showToast('Conta Google Drive nao vinculada ao item salvo.', 'warning');
+    return true;
+  }
+  const activeId = state.activeGoogleDriveAccount ? String(state.activeGoogleDriveAccount.account_id) : '';
+  if (activeId !== String(item.account_id)) {
+    await activateDriveAccount(item.account_id, { openAfter: false });
+    const account = state.googleDriveAccounts.find((entry) => String(entry.account_id) === String(item.account_id));
+    if (account && item.path === account.root_path) {
+      state.currentPathDisplay = displayPath(item.path, account.label);
+    }
+  }
+  return false;
+}
+
 function openPregaoModal() {
   if (!state.currentPath) {
     showToast('Nenhum caminho selecionado.', 'warning');
@@ -1959,11 +2152,15 @@ function renderPregoes(pregoes) {
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'btn btn-link text-start flex-grow-1';
-    link.textContent = pregao.name;
+    link.textContent = formatSavedItemLabel(pregao);
     if (state.selectedPregao && state.selectedPregao.path === pregao.path) {
       link.classList.add('fw-semibold', 'text-primary');
     }
-    link.addEventListener('click', () => {
+    link.addEventListener('click', async () => {
+      const handled = await openSavedDriveItem(pregao);
+      if (handled && pregao.account_status !== 'connected') {
+        return;
+      }
       state.currentPath = pregao.path;
       state.currentPathDisplay = displayPath(pregao.path, pregao.path);
       state.selectedPregao = { name: pregao.name, path: pregao.path };
@@ -1972,7 +2169,7 @@ function renderPregoes(pregoes) {
       if (inp) inp.value = state.currentPathDisplay || pregao.path;
       renderFavorites(state.favorites);
       updatePregaoSelectionButton();
-      reloadDirectory(true);
+      await reloadDirectory(true);
     });
 
     const removeBtn = document.createElement('button');
@@ -2090,11 +2287,15 @@ function renderFavorites(favorites) {
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'btn btn-link text-start flex-grow-1';
-    link.textContent = favorite.name;
+    link.textContent = formatSavedItemLabel(favorite);
     if (state.selectedFavorite && state.selectedFavorite.path === favorite.path) {
       link.classList.add('fw-semibold', 'text-primary');
     }
-    link.addEventListener('click', () => {
+    link.addEventListener('click', async () => {
+      const handled = await openSavedDriveItem(favorite);
+      if (handled && favorite.account_status !== 'connected') {
+        return;
+      }
       state.currentPath = favorite.path;
       state.currentPathDisplay = displayPath(favorite.path, favorite.path);
       state.selectedFavorite = { name: favorite.name, path: favorite.path };
@@ -2103,7 +2304,7 @@ function renderFavorites(favorites) {
       if (inp) inp.value = state.currentPathDisplay || favorite.path;
       renderPregoes(state.pregoes);
       updateFavoriteSelectionButton();
-      reloadDirectory(true);
+      await reloadDirectory(true);
     });
 
     const removeBtn = document.createElement('button');
@@ -2115,7 +2316,7 @@ function renderFavorites(favorites) {
         const response = await fetch('/api/favorites/delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: favorite.name }),
+          body: JSON.stringify({ name: favorite.name, path: favorite.path, file_id: favorite.file_id || favorite.id }),
         });
         const payload = await response.json();
         if (!response.ok || !payload.success) {

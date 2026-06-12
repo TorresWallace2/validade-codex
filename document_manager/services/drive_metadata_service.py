@@ -88,29 +88,73 @@ def init_schema() -> None:
                 CREATE TABLE IF NOT EXISTS drive_user_favorites (
                     username TEXT NOT NULL,
                     file_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL DEFAULT '',
                     name TEXT NOT NULL,
                     source_uri TEXT NOT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY(username, file_id),
-                    UNIQUE(username, name)
+                    UNIQUE(username, account_id, name)
                 );
 
                 CREATE TABLE IF NOT EXISTS drive_user_presets (
                     username TEXT NOT NULL,
                     file_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL DEFAULT '',
                     name TEXT NOT NULL,
                     source_uri TEXT NOT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY(username, file_id),
-                    UNIQUE(username, name)
+                    UNIQUE(username, account_id, name)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_drive_file_metadata_updated_at
                     ON drive_file_metadata(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_drive_user_favorites_username
                     ON drive_user_favorites(username);
+                CREATE INDEX IF NOT EXISTS idx_drive_user_favorites_username_account
+                    ON drive_user_favorites(username, account_id);
                 CREATE INDEX IF NOT EXISTS idx_drive_user_presets_username
                     ON drive_user_presets(username);
+                CREATE INDEX IF NOT EXISTS idx_drive_user_presets_username_account
+                    ON drive_user_presets(username, account_id);
+                """
+            )
+            cur.execute("ALTER TABLE drive_user_favorites ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE drive_user_presets ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT ''")
+            cur.execute("UPDATE drive_user_favorites SET account_id = COALESCE(account_id, '') WHERE account_id IS NULL")
+            cur.execute("UPDATE drive_user_presets SET account_id = COALESCE(account_id, '') WHERE account_id IS NULL")
+            cur.execute("ALTER TABLE drive_user_favorites DROP CONSTRAINT IF EXISTS drive_user_favorites_username_name_key")
+            cur.execute("ALTER TABLE drive_user_presets DROP CONSTRAINT IF EXISTS drive_user_presets_username_name_key")
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_indexes
+                        WHERE schemaname = ANY (current_schemas(false))
+                          AND indexname = 'uq_drive_user_favorites_username_account_name'
+                    ) THEN
+                        CREATE UNIQUE INDEX uq_drive_user_favorites_username_account_name
+                        ON drive_user_favorites(username, account_id, name);
+                    END IF;
+                END $$;
+                """
+            )
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_indexes
+                        WHERE schemaname = ANY (current_schemas(false))
+                          AND indexname = 'uq_drive_user_presets_username_account_name'
+                    ) THEN
+                        CREATE UNIQUE INDEX uq_drive_user_presets_username_account_name
+                        ON drive_user_presets(username, account_id, name);
+                    END IF;
+                END $$;
                 """
             )
 
@@ -317,7 +361,7 @@ def set_auctions(file_id: str, auctions: str) -> dict[str, Any]:
             return dict(cur.fetchone())
 
 
-def add_favorite(username: str, file_id: str, name: str, source_uri: str) -> dict[str, Any]:
+def add_favorite(username: str, file_id: str, account_id: str, name: str, source_uri: str) -> dict[str, Any]:
     ensure_schema()
     username = (username or "").strip().upper()
     with _connect() as conn:
@@ -336,14 +380,15 @@ def add_favorite(username: str, file_id: str, name: str, source_uri: str) -> dic
             )
             cur.execute(
                 """
-                INSERT INTO drive_user_favorites(username, file_id, name, source_uri)
-                VALUES(%s, %s, %s, %s)
+                INSERT INTO drive_user_favorites(username, file_id, account_id, name, source_uri)
+                VALUES(%s, %s, %s, %s, %s)
                 ON CONFLICT(username, file_id) DO UPDATE SET
+                    account_id = EXCLUDED.account_id,
                     name = EXCLUDED.name,
                     source_uri = EXCLUDED.source_uri
-                RETURNING file_id AS id, file_id, name, source_uri AS path, created_at
+                RETURNING file_id AS id, file_id, account_id, name, source_uri AS path, created_at
                 """,
-                (username, file_id, name, source_uri),
+                (username, file_id, account_id, name, source_uri),
             )
             return dict(cur.fetchone())
 
@@ -355,7 +400,7 @@ def list_favorites(username: str) -> list[dict[str, Any]]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(
                 """
-                SELECT file_id AS id, file_id, name, source_uri AS path, created_at
+                SELECT file_id AS id, file_id, account_id, name, source_uri AS path, created_at
                 FROM drive_user_favorites
                 WHERE username = %s
                 ORDER BY name ASC
@@ -378,21 +423,22 @@ def delete_favorite(username: str, name: str | None = None, file_id: str | None 
                 raise DriveMetadataError("Favorito nao encontrado.")
 
 
-def add_preset(username: str, file_id: str, name: str, source_uri: str) -> dict[str, Any]:
+def add_preset(username: str, file_id: str, account_id: str, name: str, source_uri: str) -> dict[str, Any]:
     ensure_schema()
     username = (username or "").strip().upper()
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(
                 """
-                INSERT INTO drive_user_presets(username, file_id, name, source_uri)
-                VALUES(%s, %s, %s, %s)
+                INSERT INTO drive_user_presets(username, file_id, account_id, name, source_uri)
+                VALUES(%s, %s, %s, %s, %s)
                 ON CONFLICT(username, file_id) DO UPDATE SET
+                    account_id = EXCLUDED.account_id,
                     name = EXCLUDED.name,
                     source_uri = EXCLUDED.source_uri
-                RETURNING file_id AS id, file_id, name, source_uri AS path, created_at
+                RETURNING file_id AS id, file_id, account_id, name, source_uri AS path, created_at
                 """,
-                (username, file_id, name, source_uri),
+                (username, file_id, account_id, name, source_uri),
             )
             return dict(cur.fetchone())
 
@@ -404,7 +450,7 @@ def list_presets(username: str) -> list[dict[str, Any]]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:  # type: ignore[union-attr]
             cur.execute(
                 """
-                SELECT file_id AS id, file_id, name, source_uri AS path, created_at
+                SELECT file_id AS id, file_id, account_id, name, source_uri AS path, created_at
                 FROM drive_user_presets
                 WHERE username = %s
                 ORDER BY name ASC

@@ -143,7 +143,50 @@ def init_schema() -> None:
             UNIQUE(user_id, name),
             UNIQUE(user_id, path)
         );
+
+        CREATE TABLE IF NOT EXISTS drive_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            google_email TEXT NOT NULL,
+            google_name TEXT NOT NULL DEFAULT '',
+            google_permission_id TEXT,
+            status TEXT NOT NULL DEFAULT 'connected',
+            is_active INTEGER NOT NULL DEFAULT 0,
+            credentials_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_connected_at TEXT,
+            last_used_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
+    )
+
+    if not _table_has_column('drive_accounts', 'google_permission_id'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN google_permission_id TEXT")
+    if not _table_has_column('drive_accounts', 'status'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'connected'")
+    if not _table_has_column('drive_accounts', 'is_active'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN is_active INTEGER NOT NULL DEFAULT 0")
+    if not _table_has_column('drive_accounts', 'credentials_json'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN credentials_json TEXT")
+    if not _table_has_column('drive_accounts', 'created_at'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+    if not _table_has_column('drive_accounts', 'updated_at'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+    if not _table_has_column('drive_accounts', 'last_connected_at'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN last_connected_at TEXT")
+    if not _table_has_column('drive_accounts', 'last_used_at'):
+        cursor.execute("ALTER TABLE drive_accounts ADD COLUMN last_used_at TEXT")
+
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_accounts_user_email ON drive_accounts(user_id, google_email)"
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_accounts_user_permission ON drive_accounts(user_id, google_permission_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_drive_accounts_user_active ON drive_accounts(user_id, is_active)"
     )
 
     config = current_app.config["APP_CONFIG"]

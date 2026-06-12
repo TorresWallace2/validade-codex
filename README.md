@@ -22,10 +22,20 @@ Aplicação web completa para gestão e controle de documentos com Flask e Boots
    ```bash
    pip install -r requirements.txt
    ```
-3. Execute a aplicação:\r
+3. Crie o arquivo `.env` a partir do exemplo e preencha as credenciais quando for usar Google Drive:
+   ```bash
+   copy .env.example .env
+   ```
+   Configure no `.env`:
+   ```env
+   GOOGLE_CLIENT_ID=seu-client-id
+   GOOGLE_CLIENT_SECRET=seu-client-secret
+   GOOGLE_REDIRECT_URI=http://localhost:5000/auth/google/callback
+   ```
+4. Execute a aplicação:
    ```bash
    python app.py
    ```
-4. Acesse em [http://localhost:5000](http://localhost:5000).
+5. Acesse em [http://localhost:5000](http://localhost:5000).
 
 O banco SQLite é criado automaticamente em `instance/documents.db` na primeira execução.

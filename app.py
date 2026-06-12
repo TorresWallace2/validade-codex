@@ -1,4 +1,5 @@
-﻿"""Application entry-point."""
+﻿
+"""Application entry-point."""
 from __future__ import annotations
 
 from document_manager import create_app

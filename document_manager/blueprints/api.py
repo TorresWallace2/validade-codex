@@ -601,7 +601,7 @@ def get_presets() -> Response:
         return _json_unauthorised()
     local_presets = svc.list_presets(user["username"])
     try:
-        drive_presets = drive_meta_svc.list_presets(user["username"])
+        drive_presets = drive_svc.annotate_saved_items(drive_meta_svc.list_presets(user["username"]))
     except drive_meta_svc.DriveMetadataError:
         drive_presets = []
     return _json_success({"data": local_presets + drive_presets})
@@ -619,8 +619,9 @@ def create_preset() -> Response:
         return _json_error("Informe nome e caminho.")
     try:
         if drive_svc.is_drive_path(path):
-            file_id = drive_svc.path_to_id(path)
-            data = drive_meta_svc.add_preset(user["username"], file_id, name, path)
+            file_id = drive_svc.metadata_file_id_for_path(path)
+            account_id = drive_svc.path_to_account_id(path)
+            data = drive_meta_svc.add_preset(user["username"], file_id, account_id, name, path)
             return _json_success({"data": data}, HTTPStatus.CREATED)
         data = svc.add_preset(user["username"], name, path)
         return _json_success({"data": data}, HTTPStatus.CREATED)
@@ -637,9 +638,7 @@ def remove_preset(preset_id: str) -> Response:
         return _json_unauthorised()
     try:
         if preset_id.startswith("gdrive://"):
-            drive_meta_svc.delete_preset(
-                user["username"], drive_svc.path_to_id(preset_id)
-            )
+            drive_meta_svc.delete_preset(user["username"], drive_svc.metadata_file_id_for_path(preset_id))
         elif not preset_id.isdigit():
             drive_meta_svc.delete_preset(user["username"], preset_id)
         else:
@@ -658,7 +657,7 @@ def get_favorites() -> Response:
         return _json_unauthorised()
     local_favorites = svc.list_favorites(user["username"])
     try:
-        drive_favorites = drive_meta_svc.list_favorites(user["username"])
+        drive_favorites = drive_svc.annotate_saved_items(drive_meta_svc.list_favorites(user["username"]))
     except drive_meta_svc.DriveMetadataError:
         drive_favorites = []
     return _json_success({"data": local_favorites + drive_favorites})
@@ -676,8 +675,9 @@ def add_favorite() -> Response:
         return _json_error("Informe nome e caminho.")
     try:
         if drive_svc.is_drive_path(path):
-            file_id = drive_svc.path_to_id(path)
-            data = drive_meta_svc.add_favorite(user["username"], file_id, name, path)
+            file_id = drive_svc.metadata_file_id_for_path(path)
+            account_id = drive_svc.path_to_account_id(path)
+            data = drive_meta_svc.add_favorite(user["username"], file_id, account_id, name, path)
             return _json_success({"data": data}, HTTPStatus.CREATED)
         data = svc.add_favorite(user["username"], name, path)
         return _json_success({"data": data}, HTTPStatus.CREATED)
@@ -695,11 +695,13 @@ def delete_favorite() -> Response:
     payload = request.get_json(silent=True) or {}
     name = payload.get("name")
     path = payload.get("path")
+    file_id = payload.get("file_id")
     try:
         if path and drive_svc.is_drive_path(path):
-            drive_meta_svc.delete_favorite(
-                user["username"], file_id=drive_svc.path_to_id(path)
-            )
+            drive_meta_svc.delete_favorite(user["username"], file_id=drive_svc.metadata_file_id_for_path(path))
+            return _json_success()
+        if file_id and not str(file_id).isdigit():
+            drive_meta_svc.delete_favorite(user["username"], file_id=str(file_id))
             return _json_success()
         if not name:
             return _json_error("Informe o nome do favorito.")

@@ -1,4 +1,4 @@
-"""Google Drive OAuth and API routes."""
+"""Google Drive OAuth and account routes."""
 from __future__ import annotations
 
 from http import HTTPStatus
@@ -24,7 +24,7 @@ def _json_error(message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Re
 @google_drive_bp.get("/auth/google/connect")
 def connect_google_drive():
     try:
-        return redirect(drive.authorization_url())
+        return redirect(drive.connect_new_authorization_url())
     except drive.GoogleDriveError as exc:
         return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
 
@@ -32,21 +32,62 @@ def connect_google_drive():
 @google_drive_bp.get("/auth/google/callback")
 def google_drive_callback():
     try:
-        drive.finish_authorization(request.url, request.args.get("state"))
+        account = drive.finish_authorization(request.url, request.args.get("state"))
     except drive.GoogleDriveError as exc:
         return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
-    return redirect(url_for("ui.index", drive="connected"))
+    return redirect(url_for("ui.index", drive="connected", account_id=account["account_id"]))
 
 
-@google_drive_bp.post("/api/google-drive/disconnect")
-def disconnect_google_drive() -> Response:
-    drive.disconnect()
-    return _json_success()
+@google_drive_bp.get("/auth/google/reconnect/<account_id>")
+def reconnect_google_drive(account_id: str):
+    try:
+        return redirect(drive.reconnect_authorization_url(account_id))
+    except drive.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
 
 
 @google_drive_bp.get("/api/google-drive/status")
 def google_drive_status() -> Response:
-    return _json_success({"data": {"connected": drive.is_connected(), "root_path": drive.ROOT_PATH}})
+    return _json_success({"data": drive.accounts_status()})
+
+
+@google_drive_bp.get("/api/google-drive/accounts")
+def google_drive_accounts() -> Response:
+    return _json_success({"data": drive.list_accounts()})
+
+
+@google_drive_bp.post("/api/google-drive/accounts/connect")
+def connect_google_drive_account() -> Response:
+    try:
+        return _json_success({"data": {"auth_url": drive.connect_new_authorization_url()}})
+    except drive.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
+
+
+@google_drive_bp.post("/api/google-drive/accounts/<account_id>/activate")
+def activate_google_drive_account(account_id: str) -> Response:
+    try:
+        account = drive.activate_account(account_id)
+        return _json_success({"data": account})
+    except drive.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
+
+
+@google_drive_bp.post("/api/google-drive/accounts/<account_id>/disconnect")
+def disconnect_google_drive_account(account_id: str) -> Response:
+    try:
+        drive.disconnect(account_id)
+        return _json_success()
+    except drive.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
+
+
+@google_drive_bp.post("/api/google-drive/accounts/<account_id>/reconnect")
+def reconnect_google_drive_account(account_id: str) -> Response:
+    try:
+        return _json_success({"data": {"auth_url": drive.reconnect_authorization_url(account_id)}})
+    except drive.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
 
 
 @google_drive_bp.post("/api/google-drive/open")

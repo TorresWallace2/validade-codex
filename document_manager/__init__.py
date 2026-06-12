@@ -5,7 +5,11 @@ from pathlib import Path
 from datetime import timedelta
 import os
 
+from dotenv import load_dotenv
 from flask import Flask
+
+
+load_dotenv()
 
 from .config import load_config
 from .db import init_app as init_db

@@ -56,6 +56,13 @@ class GoogleDriveError(Exception):
     """Raised when the Google Drive integration cannot complete an operation."""
 
 
+def _log_metadata_warning(action: str, exc: Exception) -> None:
+    try:
+        current_app.logger.warning("google_drive metadata fallback during %s: %s", action, exc)
+    except Exception:
+        pass
+
+
 def _redirect_uri() -> str:
     return os.environ.get("GOOGLE_REDIRECT_URI", "").strip()
 
@@ -756,7 +763,11 @@ def _display_path_from_breadcrumbs(breadcrumbs: Sequence[dict[str, str]] | None)
 
 def _metadata_for_list_items(account: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     ids = [_metadata_file_id(account["account_id"], item["id"]) for item in items]
-    metadata_map = metadata_svc.get_metadata_map(ids) if ids else {}
+    try:
+        metadata_map = metadata_svc.get_metadata_map(ids) if ids else {}
+    except metadata_svc.DriveMetadataError as exc:
+        _log_metadata_warning("list_items", exc)
+        metadata_map = {}
     for item in items:
         item_id = _metadata_file_id(account["account_id"], item["id"])
         if item.get("mimeType") == DRIVE_FOLDER_MIME_TYPE or item_id in metadata_map:
@@ -779,7 +790,27 @@ def _metadata_for_list_items(account: dict[str, Any], items: list[dict[str, Any]
 
 def _apply_metadata_to_items(account: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     ids = [_metadata_file_id(account["account_id"], item["id"]) for item in items]
-    metadata_map = metadata_svc.get_metadata_map(ids) if ids else {}
+    try:
+        metadata_map = metadata_svc.get_metadata_map(ids) if ids else {}
+    except metadata_svc.DriveMetadataError as exc:
+        _log_metadata_warning("details", exc)
+        metadata_map = {}
+        for item in items:
+            meta_id = _metadata_file_id(account["account_id"], item["id"])
+            is_folder = item.get("mimeType") == DRIVE_FOLDER_MIME_TYPE
+            inferred = None if is_folder else _extract_validity_from_filename(item.get("name", ""))
+            metadata_map[meta_id] = {
+                "validity_type": "defined" if inferred is not None else "not_defined",
+                "validity_date": inferred,
+                "validity_source": "filename" if inferred is not None else "not_defined",
+                "auto_detected_date": inferred,
+                "manual_locked": False,
+                "warning_days": None,
+                "notes": "",
+                "is_favorite": False,
+                "auctions": "",
+            }
+        return metadata_map
     for item in items:
         meta_id = _metadata_file_id(account["account_id"], item["id"])
         is_folder = item.get("mimeType") == DRIVE_FOLDER_MIME_TYPE

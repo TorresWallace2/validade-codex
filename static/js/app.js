@@ -971,10 +971,10 @@ async function loadDirectory(reset = false, options = {}) {
 
   try {
     const response = await fetch(`/api/list_items?${params.toString()}`);
-    if (!response.ok) {
-      throw new Error('Falha ao carregar itens.');
-    }
     const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || 'Falha ao carregar itens.');
+    }
     if (!payload.success) {
       throw new Error(payload.error || 'Erro ao listar itens.');
     }

@@ -48,12 +48,18 @@ def reconnect_google_drive(account_id: str):
 
 @google_drive_bp.get("/api/google-drive/status")
 def google_drive_status() -> Response:
-    return _json_success({"data": drive.accounts_status()})
+    try:
+        return _json_success({"data": drive.accounts_status()})
+    except drive.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
 
 
 @google_drive_bp.get("/api/google-drive/accounts")
 def google_drive_accounts() -> Response:
-    return _json_success({"data": drive.list_accounts()})
+    try:
+        return _json_success({"data": drive.list_accounts()})
+    except drive.GoogleDriveError as exc:
+        return _json_error(str(exc), HTTPStatus.BAD_REQUEST)
 
 
 @google_drive_bp.post("/api/google-drive/accounts/connect")

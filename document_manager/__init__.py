@@ -18,6 +18,7 @@ from .blueprints.auth import auth_bp
 from .blueprints.api import api_bp
 from .blueprints.ui import ui_bp
 from .blueprints.google_drive import google_drive_bp
+from .services import drive_accounts_storage
 
 
 def create_app() -> Flask:
@@ -37,6 +38,13 @@ def create_app() -> Flask:
 
     init_db(app)
     init_auth(app)
+
+    if os.environ.get("DATABASE_URL", "").strip():
+        with app.app_context():
+            try:
+                drive_accounts_storage.ensure_schema()
+            except drive_accounts_storage.DriveAccountsStorageError as exc:
+                app.logger.warning("drive accounts storage unavailable during startup: %s", exc)
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(ui_bp)

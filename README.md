@@ -31,11 +31,13 @@ Aplicação web completa para gestão e controle de documentos com Flask e Boots
    GOOGLE_CLIENT_ID=seu-client-id
    GOOGLE_CLIENT_SECRET=seu-client-secret
    GOOGLE_REDIRECT_URI=http://localhost:5000/auth/google/callback
+   DATABASE_URL=postgresql://user:password@host:5432/database
    ```
+   `DATABASE_URL` e obrigatoria no Render para persistir as contas conectadas do Google Drive entre restarts e novos deploys.
 4. Execute a aplicação:
    ```bash
    python app.py
    ```
 5. Acesse em [http://localhost:5000](http://localhost:5000).
 
-O banco SQLite é criado automaticamente em `instance/documents.db` na primeira execução.
+O banco SQLite e criado automaticamente em `instance/documents.db` na primeira execucao para os dados locais do app. As contas conectadas do Google Drive passam a ser persistidas no Postgres configurado em `DATABASE_URL`.

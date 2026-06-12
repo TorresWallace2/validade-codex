@@ -30,6 +30,7 @@ from ..status import (
     parse_validity_date,
 )
 from . import drive_metadata_service as metadata_svc
+from . import drive_accounts_storage as accounts_storage
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -98,12 +99,14 @@ def _current_username() -> str:
     return username
 
 
-def _current_user_id() -> int:
+def _ensure_accounts_storage_ready() -> str:
     username = _current_username()
-    rows = db.query("SELECT id FROM users WHERE username = ?", (username,))
-    if not rows:
-        raise GoogleDriveError("Usuario nao encontrado.")
-    return int(rows[0]["id"])
+    try:
+        accounts_storage.ensure_schema()
+        accounts_storage.migrate_legacy_accounts_for_username(username)
+    except accounts_storage.DriveAccountsStorageError as exc:
+        raise GoogleDriveError(str(exc)) from exc
+    return username
 
 
 def create_flow() -> Flow:
@@ -164,15 +167,16 @@ def _row_to_account(row: Any) -> dict[str, Any]:
 
 
 def _load_accounts() -> list[dict[str, Any]]:
-    rows = db.query(
+    username = _ensure_accounts_storage_ready()
+    rows = accounts_storage.query_all(
         """
         SELECT id, google_email, google_name, google_permission_id, status, is_active, credentials_json,
                created_at, updated_at, last_connected_at, last_used_at
         FROM drive_accounts
-        WHERE user_id = ?
+        WHERE username = %s
         ORDER BY is_active DESC, google_email ASC, id ASC
         """,
-        (_current_user_id(),),
+        (username,),
     )
     return [_row_to_account(row) for row in rows]
 
@@ -203,27 +207,28 @@ def account_label(account: dict[str, Any] | None) -> str:
 
 
 def _set_only_active(account_id: str) -> None:
-    user_id = _current_user_id()
-    db.execute("UPDATE drive_accounts SET is_active = 0 WHERE user_id = ?", (user_id,))
-    db.execute(
-        "UPDATE drive_accounts SET is_active = 1, updated_at = ?, last_used_at = ? WHERE user_id = ? AND id = ?",
-        (_utcnow_iso(), _utcnow_iso(), user_id, int(account_id)),
+    username = _ensure_accounts_storage_ready()
+    now = _utcnow_iso()
+    accounts_storage.execute("UPDATE drive_accounts SET is_active = FALSE WHERE username = %s", (username,))
+    accounts_storage.execute(
+        "UPDATE drive_accounts SET is_active = TRUE, updated_at = %s, last_used_at = %s WHERE username = %s AND id = %s",
+        (now, now, username, int(account_id)),
     )
 
 
 def get_account(account_id: str, *, require_connected: bool = False) -> dict[str, Any]:
-    rows = db.query(
+    username = _ensure_accounts_storage_ready()
+    row = accounts_storage.query_one(
         """
         SELECT id, google_email, google_name, google_permission_id, status, is_active, credentials_json,
                created_at, updated_at, last_connected_at, last_used_at
         FROM drive_accounts
-        WHERE user_id = ? AND id = ?
+        WHERE username = %s AND id = %s
         """,
-        (_current_user_id(), int(account_id)),
+        (username, int(account_id)),
     )
-    if not rows:
+    if not row:
         raise GoogleDriveError("Conta Google Drive nao encontrada.")
-    row = rows[0]
     data = dict(row)
     data["account_id"] = str(row["id"])
     data["label"] = account_label({"google_email": row["google_email"], "google_name": row["google_name"]})
@@ -235,20 +240,21 @@ def get_account(account_id: str, *, require_connected: bool = False) -> dict[str
 
 
 def get_active_account(*, require_connected: bool = False) -> dict[str, Any] | None:
-    rows = db.query(
+    username = _ensure_accounts_storage_ready()
+    row = accounts_storage.query_one(
         """
         SELECT id, google_email, google_name, google_permission_id, status, is_active, credentials_json,
                created_at, updated_at, last_connected_at, last_used_at
         FROM drive_accounts
-        WHERE user_id = ? AND is_active = 1
+        WHERE username = %s AND is_active = TRUE
         ORDER BY id DESC
         LIMIT 1
         """,
-        (_current_user_id(),),
+        (username,),
     )
-    if not rows:
+    if not row:
         return None
-    account = get_account(str(rows[0]["id"]), require_connected=require_connected)
+    account = get_account(str(row["id"]), require_connected=require_connected)
     return account
 
 
@@ -272,16 +278,17 @@ def disconnect(account_id: str | None = None) -> None:
         target = active["account_id"] if active else None
     if not target:
         return
-    db.execute(
+    username = _ensure_accounts_storage_ready()
+    accounts_storage.execute(
         """
         UPDATE drive_accounts
         SET status = 'disconnected',
-            is_active = 0,
+            is_active = FALSE,
             credentials_json = NULL,
-            updated_at = ?
-        WHERE user_id = ? AND id = ?
+            updated_at = %s
+        WHERE username = %s AND id = %s
         """,
-        (_utcnow_iso(), _current_user_id(), int(target)),
+        (_utcnow_iso(), username, int(target)),
     )
     _clear_drive_session_caches(target)
 
@@ -356,9 +363,11 @@ def build_service_for_account(account_id: str):
     credentials = _credentials_from_dict(json.loads(credentials_json))
     if not credentials:
         raise GoogleDriveError("Credenciais do Google Drive indisponiveis.")
-    db.execute(
-        "UPDATE drive_accounts SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND id = ?",
-        (_utcnow_iso(), _utcnow_iso(), _current_user_id(), int(account_id)),
+    username = _ensure_accounts_storage_ready()
+    now = _utcnow_iso()
+    accounts_storage.execute(
+        "UPDATE drive_accounts SET last_used_at = %s, updated_at = %s WHERE username = %s AND id = %s",
+        (now, now, username, int(account_id)),
     )
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
@@ -418,27 +427,27 @@ def finish_authorization(authorization_response: str, state: str | None) -> dict
 
     profile = _fetch_google_profile(credentials)
     intent = str(session.get("google_oauth_intent") or "connect_new")
-    user_id = _current_user_id()
+    username = _ensure_accounts_storage_ready()
     now = _utcnow_iso()
     credentials_json = json.dumps(_credentials_to_dict(credentials), ensure_ascii=False)
-    rows = db.query(
+    row = accounts_storage.query_one(
         """
         SELECT id
         FROM drive_accounts
-        WHERE user_id = ? AND (google_permission_id = ? OR google_email = ?)
+        WHERE username = %s AND (google_permission_id = %s OR google_email = %s)
         ORDER BY id DESC
         LIMIT 1
         """,
-        (user_id, profile["permission_id"], profile["email"]),
+        (username, profile["permission_id"] or None, profile["email"]),
     )
-    if rows:
-        account_id = str(rows[0]["id"])
-        db.execute(
+    if row:
+        account_id = str(row["id"])
+        accounts_storage.execute(
             """
             UPDATE drive_accounts
-            SET google_email = ?, google_name = ?, google_permission_id = ?, status = 'connected',
-                credentials_json = ?, updated_at = ?, last_connected_at = ?, last_used_at = ?
-            WHERE user_id = ? AND id = ?
+            SET google_email = %s, google_name = %s, google_permission_id = %s, status = 'connected',
+                credentials_json = %s, updated_at = %s, last_connected_at = %s, last_used_at = %s
+            WHERE username = %s AND id = %s
             """,
             (
                 profile["email"],
@@ -448,21 +457,21 @@ def finish_authorization(authorization_response: str, state: str | None) -> dict
                 now,
                 now,
                 now,
-                user_id,
+                username,
                 int(account_id),
             ),
         )
     else:
-        db.execute(
+        accounts_storage.execute(
             """
             INSERT INTO drive_accounts(
-                user_id, google_email, google_name, google_permission_id, status, is_active,
+                username, google_email, google_name, google_permission_id, status, is_active,
                 credentials_json, created_at, updated_at, last_connected_at, last_used_at
             )
-            VALUES(?, ?, ?, ?, 'connected', 0, ?, ?, ?, ?, ?)
+            VALUES(%s, %s, %s, %s, 'connected', FALSE, %s, %s, %s, %s, %s)
             """,
             (
-                user_id,
+                username,
                 profile["email"],
                 profile["name"],
                 profile["permission_id"] or None,
@@ -473,22 +482,23 @@ def finish_authorization(authorization_response: str, state: str | None) -> dict
                 now,
             ),
         )
-        account_id = str(
-            db.query(
-                "SELECT id FROM drive_accounts WHERE user_id = ? AND google_email = ? ORDER BY id DESC LIMIT 1",
-                (user_id, profile["email"]),
-            )[0]["id"]
+        created = accounts_storage.query_one(
+            "SELECT id FROM drive_accounts WHERE username = %s AND google_email = %s ORDER BY id DESC LIMIT 1",
+            (username, profile["email"]),
         )
+        if not created:
+            raise GoogleDriveError("Falha ao persistir a conta Google Drive conectada.")
+        account_id = str(created["id"])
 
     if intent.startswith("reconnect:"):
         reconnect_target = intent.split(":", 1)[1].strip()
         if reconnect_target and reconnect_target != account_id:
-            db.execute(
+            accounts_storage.execute(
                 """
                 UPDATE drive_accounts
-                SET google_email = ?, google_name = ?, google_permission_id = ?, status = 'connected',
-                    credentials_json = ?, updated_at = ?, last_connected_at = ?, last_used_at = ?
-                WHERE user_id = ? AND id = ?
+                SET google_email = %s, google_name = %s, google_permission_id = %s, status = 'connected',
+                    credentials_json = %s, updated_at = %s, last_connected_at = %s, last_used_at = %s
+                WHERE username = %s AND id = %s
                 """,
                 (
                     profile["email"],
@@ -498,7 +508,7 @@ def finish_authorization(authorization_response: str, state: str | None) -> dict
                     now,
                     now,
                     now,
-                    user_id,
+                    username,
                     int(reconnect_target),
                 ),
             )

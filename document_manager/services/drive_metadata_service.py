@@ -106,17 +106,6 @@ def init_schema() -> None:
                     PRIMARY KEY(username, file_id),
                     UNIQUE(username, account_id, name)
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_drive_file_metadata_updated_at
-                    ON drive_file_metadata(updated_at);
-                CREATE INDEX IF NOT EXISTS idx_drive_user_favorites_username
-                    ON drive_user_favorites(username);
-                CREATE INDEX IF NOT EXISTS idx_drive_user_favorites_username_account
-                    ON drive_user_favorites(username, account_id);
-                CREATE INDEX IF NOT EXISTS idx_drive_user_presets_username
-                    ON drive_user_presets(username);
-                CREATE INDEX IF NOT EXISTS idx_drive_user_presets_username_account
-                    ON drive_user_presets(username, account_id);
                 """
             )
             cur.execute("ALTER TABLE drive_user_favorites ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT ''")
@@ -125,6 +114,36 @@ def init_schema() -> None:
             cur.execute("UPDATE drive_user_presets SET account_id = COALESCE(account_id, '') WHERE account_id IS NULL")
             cur.execute("ALTER TABLE drive_user_favorites DROP CONSTRAINT IF EXISTS drive_user_favorites_username_name_key")
             cur.execute("ALTER TABLE drive_user_presets DROP CONSTRAINT IF EXISTS drive_user_presets_username_name_key")
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_drive_file_metadata_updated_at
+                    ON drive_file_metadata(updated_at)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_drive_user_favorites_username
+                    ON drive_user_favorites(username)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_drive_user_favorites_username_account
+                    ON drive_user_favorites(username, account_id)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_drive_user_presets_username
+                    ON drive_user_presets(username)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_drive_user_presets_username_account
+                    ON drive_user_presets(username, account_id)
+                """
+            )
             cur.execute(
                 """
                 DO $$
